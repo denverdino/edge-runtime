@@ -5,7 +5,7 @@
 
 import { Console } from "ext:deno_node/internal/console/constructor.mjs";
 import * as DenoConsole from "ext:deno_console/01_console.js";
-import { nonEnumerable } from "ext:runtime/fieldUtils.js";
+import { nonEnumerable } from "ext:runtime_node_compat/fieldUtils.js";
 
 import { core } from "ext:core/mod.js";
 

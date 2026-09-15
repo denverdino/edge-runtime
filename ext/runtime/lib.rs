@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use base_mem_check::WorkerHeapStatistics;
 use base_rt::DropToken;
@@ -20,6 +21,7 @@ use futures::FutureExt;
 use log::error;
 use serde::Serialize;
 use tokio::sync::oneshot;
+use tokio::sync::Semaphore;
 use tracing::debug;
 use tracing::debug_span;
 
@@ -492,6 +494,163 @@ pub fn op_check_outbound_rate_limit(
   }
 }
 
+/// The parser is recursive descent with no depth guard, so deeply nested source
+/// overflows its stack and aborts the process with
+/// `fatal runtime error: stack overflow`. That is not a panic, so `catch_unwind`
+/// cannot intercept it, and the crash takes down every sandbox at once.
+///
+/// Two bounds are needed together, both measured against this parser:
+///
+///  * A large stack. On the default stack the abort came at roughly 1000-2000
+///    nesting levels. Counting brackets does not bound it — `!`, `x=>`, `a?1:`,
+///    `a=b=` and `if(a)` chains all abort with zero or constant bracket depth.
+///  * A source-size limit. A large stack alone is not sound either, because
+///    per-level cost varies by construct: with 512 MiB, 50,000 unary levels
+///    (50 KiB) parsed fine while 50,000 arrow levels (150 KiB) and 100,000
+///    parens (200 KiB) still aborted. Since the worst case is one recursion
+///    level per source byte, the input has to be capped.
+///
+/// 16 KiB against 512 MiB leaves roughly a 3x margin at the ~10 KiB per level
+/// the arrow-chain measurement implies. The stack is reserved lazily, so its
+/// cost is virtual address space, not resident memory.
+const TRANSPILE_STACK_BYTES: usize = 512 * 1024 * 1024;
+const MAX_TRANSPILE_SOURCE_BYTES: usize = 16 * 1024;
+
+/// Whether this isolate may transpile TypeScript.
+///
+/// Only the trusted E2B executor opts in. The parser runs arbitrary source on a
+/// 512 MiB stack, so a user worker that did not request it must not reach the
+/// op at all — gating only the namespace would still leave the op callable.
+pub struct AllowTranspile(pub bool);
+
+/// One process-wide gate on concurrent parses.
+///
+/// Each parse reserves a 512 MiB stack, so without a cap enough concurrent
+/// callers could reserve that stack many times over. The permit count is the
+/// available parallelism: enough to keep the CPUs busy, few enough that the
+/// reserved address space stays bounded.
+fn transpile_permits() -> &'static Semaphore {
+  static PERMITS: OnceLock<Semaphore> = OnceLock::new();
+  PERMITS.get_or_init(|| {
+    let permits = std::thread::available_parallelism()
+      .map(|it| it.get())
+      .unwrap_or(1);
+    Semaphore::new(permits)
+  })
+}
+
+#[op2(async)]
+#[string]
+pub async fn op_transpile_ts(
+  state: Rc<RefCell<OpState>>,
+  #[string] source: String,
+  #[string] filename: String,
+) -> Result<String, AnyError> {
+  let allowed = state
+    .borrow()
+    .try_borrow::<AllowTranspile>()
+    .map(|it| it.0)
+    .unwrap_or(false);
+
+  if !allowed {
+    return Err(anyhow::anyhow!("transpile is not enabled for this worker"));
+  }
+
+  if source.len() > MAX_TRANSPILE_SOURCE_BYTES {
+    return Err(anyhow::anyhow!(
+      "TypeScript source is {} bytes, limit is {MAX_TRANSPILE_SOURCE_BYTES}",
+      source.len()
+    ));
+  }
+
+  // Hold one permit for the parse's whole life. Moving it into the parser
+  // thread ties its release to that thread ending — whether by a clean return
+  // or a caught panic — and a failed spawn drops the closure, and the permit
+  // with it. So it is released on every path.
+  let permit = transpile_permits().acquire().await?;
+
+  // Parse on a dedicated large-stack thread. Doing it on the caller's thread
+  // would let a nested snippet take down the whole runtime.
+  let (tx, rx) = oneshot::channel();
+  let spawned = std::thread::Builder::new()
+    .name("transpile".to_string())
+    .stack_size(TRANSPILE_STACK_BYTES)
+    .spawn(move || {
+      let _permit = permit;
+      let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+          transpile_ts_inner(source, filename)
+        }));
+      let _ = tx.send(result);
+    });
+
+  // A spawn failure took the permit into the dropped closure already.
+  spawned?;
+
+  // Await the parser thread instead of joining it, so a slow parse never
+  // blocks the isolate thread.
+  match rx.await {
+    Ok(Ok(inner)) => inner,
+    Ok(Err(_)) => Err(anyhow::anyhow!("transpile panicked")),
+    Err(_) => Err(anyhow::anyhow!("transpile thread failed")),
+  }
+}
+
+fn transpile_ts_inner(
+  source: String,
+  filename: String,
+) -> Result<String, AnyError> {
+  let specifier = deno_core::ModuleSpecifier::parse(&format!(
+    "file:///{}",
+    filename.trim_start_matches('/')
+  ))?;
+
+  let parsed = deno_ast::parse_module(deno_ast::ParseParams {
+    specifier,
+    text: source.into(),
+    media_type: deno_ast::MediaType::TypeScript,
+    capture_tokens: false,
+    scope_analysis: false,
+    maybe_syntax: None,
+  })?;
+
+  let transpiled = parsed.transpile(
+    &deno_ast::TranspileOptions::default(),
+    &deno_ast::TranspileModuleOptions::default(),
+    &deno_ast::EmitOptions {
+      source_map: deno_ast::SourceMapOption::None,
+      ..Default::default()
+    },
+  )?;
+
+  Ok(transpiled.into_source().text)
+}
+
+deno_core::extension!(
+  runtime_node_compat,
+  esm = [
+    dir "js",
+    "fieldUtils.js",
+    "40_process.js",
+  ]
+);
+
+deno_core::extension!(
+  runtime_e2b,
+  esm_entry_point = "ext:runtime_e2b/e2b_bootstrap.js",
+  esm = [
+    dir "js",
+    "01_http.js",
+    "async_hook.js",
+    "denoOverrides.js",
+    "e2b_bootstrap.js",
+    "errors.js",
+    "http.js",
+    "request_context.js",
+    "permissions.js",
+  ]
+);
+
 deno_core::extension!(
   runtime,
   ops = [
@@ -511,6 +670,7 @@ deno_core::extension!(
     op_cancel_drop_token,
     op_check_outbound_rate_limit,
     op_mi_collect,
+    op_transpile_ts,
   ],
   esm_entry_point = "ext:runtime/bootstrap.js",
   esm = [

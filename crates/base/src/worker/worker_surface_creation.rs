@@ -435,7 +435,7 @@ impl WorkerSurfaceBuilder {
 
     // wait for worker to be successfully booted
     match worker_boot_result_rx.await? {
-      Ok((metric, mem_check_state, cancel)) => {
+      Ok((metric, mem_check_state, cancel, boot_timings)) => {
         let elapsed = cx.worker_boot_start_time.elapsed().as_millis();
 
         send_event_if_event_worker_available(
@@ -452,6 +452,7 @@ impl WorkerSurfaceBuilder {
           exit,
           cancel,
           mem_check: mem_check_state,
+          boot_timings,
         })
       }
 

@@ -1,4 +1,5 @@
 use std::future::ready;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -16,12 +17,15 @@ use ext_runtime::RateLimiterOpts;
 use ext_runtime::RuntimeMetricSource;
 use ext_runtime::TraceRateLimiter;
 use ext_runtime::WorkerMetricSource;
+use ext_workers::context::RuntimeInitTimings;
 use ext_workers::context::UserWorkerMsgs;
 use ext_workers::context::WorkerContextInitOpts;
 use ext_workers::context::WorkerExit;
 use ext_workers::context::WorkerExitStatus;
 use ext_workers::context::WorkerKind;
 use ext_workers::context::WorkerRequestMsg;
+use ext_workers::context::WorkerShutdown;
+use ext_workers::context::WorkerShutdownMemory;
 use futures_util::FutureExt;
 use log::debug;
 use log::error;
@@ -208,8 +212,51 @@ impl std::ops::Deref for Worker {
   }
 }
 
-pub type BooterSignalArgs =
-  (MetricSource, Arc<RwLock<MemCheckState>>, CancellationToken);
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BootTimings {
+  pub runtime_init_ms: u64,
+  pub module_init_ms: u64,
+  pub runtime_init: RuntimeInitTimings,
+}
+
+pub type BooterSignalArgs = (
+  MetricSource,
+  Arc<RwLock<MemCheckState>>,
+  CancellationToken,
+  BootTimings,
+);
+
+fn unavailable_shutdown(reason: &str) -> WorkerShutdown {
+  WorkerShutdown {
+    reason: reason.to_string(),
+    cpu_time_used: 0,
+    memory_used: None,
+  }
+}
+
+fn final_shutdown(event: &WorkerEvents) -> WorkerShutdown {
+  match event {
+    WorkerEvents::Shutdown(event) => WorkerShutdown {
+      reason: format!("{:?}", event.reason),
+      cpu_time_used: event.cpu_time_used,
+      memory_used: Some(WorkerShutdownMemory {
+        total: event.memory_used.total,
+        heap: event.memory_used.heap,
+        external: event.memory_used.external,
+      }),
+    },
+    WorkerEvents::UncaughtException(event) => WorkerShutdown {
+      reason: "UncaughtException".to_string(),
+      cpu_time_used: event.cpu_time_used,
+      memory_used: None,
+    },
+    _ => WorkerShutdown {
+      reason: "Unknown".to_string(),
+      cpu_time_used: 0,
+      memory_used: None,
+    },
+  }
+}
 
 impl Worker {
   pub fn start(
@@ -232,19 +279,29 @@ impl Worker {
     let rt = imp.runtime_handle();
     let worker_fut = async move {
       let new_runtime = 'scope: {
+        let runtime_init_start = Instant::now();
         match DenoRuntime::new(self).await {
-          Ok(mut v) => {
+          Ok((mut v, runtime_init)) => {
+            let mut boot_timings = BootTimings {
+              runtime_init_ms: runtime_init_start.elapsed().as_millis() as u64,
+              runtime_init,
+              ..Default::default()
+            };
+
             if eager_module_init {
+              let module_init_start = Instant::now();
               if let Err(err) = v.init_main_module().await {
                 break 'scope Err(err);
               }
+              boot_timings.module_init_ms =
+                module_init_start.elapsed().as_millis() as u64;
             }
-            Ok(v)
+            Ok((v, boot_timings))
           }
           Err(err) => Err(err),
         }
       };
-      let mut new_runtime = match new_runtime {
+      let (mut new_runtime, boot_timings) = match new_runtime {
         Ok(v) => v,
         Err(err) => {
           let err = CloneableError::from(err.context("worker boot error"));
@@ -294,6 +351,7 @@ impl Worker {
         metric_src,
         new_runtime.mem_check_state(),
         new_runtime.drop_token.clone(),
+        boot_timings,
       )));
 
       let span = debug_span!(
@@ -306,17 +364,6 @@ impl Worker {
         None if worker_kind.is_user_worker() => return None,
         None => ready(Ok(())).boxed(),
       };
-
-      let _guard = scopeguard::guard((), |_| {
-        if let Some((key, tx)) = worker_key.zip(pool_msg_tx) {
-          if let Err(err) = tx.send(UserWorkerMsgs::Shutdown(key)) {
-            error!(
-              "failed to send the shutdown signal to user worker pool: {:?}",
-              err
-            );
-          }
-        }
-      });
 
       let worker_poll_fut = async move {
         let result = imp.on_created(&mut new_runtime).await;
@@ -355,7 +402,30 @@ impl Worker {
     let worker_result_fut = {
       let event_metadata = event_metadata.clone();
       async move {
-        let Some(result) = worker_fut.await else {
+        let (result, panicked) =
+          match AssertUnwindSafe(worker_fut).catch_unwind().await {
+            Ok(result) => (result, false),
+            Err(_) => {
+              error!("worker future panicked");
+              (None, true)
+            }
+          };
+        let shutdown = match result.as_ref() {
+          Some(Ok(event)) => final_shutdown(event),
+          Some(Err(_)) => unavailable_shutdown("UnexpectedError"),
+          None if panicked => unavailable_shutdown("UnexpectedError"),
+          None => unavailable_shutdown("SupervisorUnavailable"),
+        };
+        if let Some((key, tx)) = worker_key.zip(pool_msg_tx) {
+          if let Err(err) = tx.send(UserWorkerMsgs::Shutdown(key, shutdown)) {
+            error!(
+              "failed to send the shutdown signal to user worker pool: {:?}",
+              err
+            );
+          }
+        }
+
+        let Some(result) = result else {
           return;
         };
 
@@ -406,4 +476,5 @@ pub struct WorkerSurface {
   pub exit: WorkerExit,
   pub cancel: CancellationToken,
   pub mem_check: Arc<RwLock<MemCheckState>>,
+  pub boot_timings: BootTimings,
 }

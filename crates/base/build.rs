@@ -244,7 +244,7 @@ mod supabase_startup_snapshot {
   pub fn create_runtime_snapshot(snapshot_path: PathBuf) {
     let user_agent = String::from("supabase");
     let fs = Arc::new(deno::deno_fs::RealFs);
-    let extensions: Vec<Extension> = vec![
+    let extensions = vec![
       deno::deno_telemetry::deno_telemetry::init_ops_and_esm(),
       deno::deno_webidl::deno_webidl::init_ops_and_esm(),
       deno_console::deno_console::init_ops_and_esm(),
@@ -287,6 +287,7 @@ mod supabase_startup_snapshot {
       ext_runtime::runtime_net::init_ops_and_esm(),
       ext_runtime::runtime_http::init_ops_and_esm(),
       ext_runtime::runtime_http_start::init_ops_and_esm(),
+      ext_runtime::runtime_node_compat::init_ops_and_esm(),
       ext_node::deno_node::init_ops_and_esm::<Permissions>(None, fs),
       // NOTE(kallebysantos):
       // Full `Web Cache API` via `SqliteBackedCache` is disabled. Cache flow is
@@ -295,6 +296,81 @@ mod supabase_startup_snapshot {
       deno::runtime::ops::permissions::deno_permissions::init_ops(),
       ext_runtime::runtime::init_ops_and_esm(),
     ];
+
+    write_runtime_snapshot(snapshot_path, None, extensions);
+  }
+
+  pub fn create_e2b_runtime_snapshot(
+    snapshot_path: PathBuf,
+    extension_manifest_path: PathBuf,
+  ) {
+    let user_agent = String::from("supabase");
+    let fs = Arc::new(deno::deno_fs::RealFs);
+    let extensions = vec![
+      deno::deno_telemetry::deno_telemetry::init_ops_and_esm(),
+      deno::deno_webidl::deno_webidl::init_ops_and_esm(),
+      deno_console::deno_console::init_ops_and_esm(),
+      deno::deno_url::deno_url::init_ops_and_esm(),
+      deno::deno_web::deno_web::init_ops_and_esm::<Permissions>(
+        Arc::new(deno::deno_web::BlobStore::default()),
+        None,
+      ),
+      deno::deno_fetch::deno_fetch::init_ops_and_esm::<Permissions>(
+        deno::deno_fetch::Options {
+          user_agent: user_agent.clone(),
+          root_cert_store_provider: None,
+          ..Default::default()
+        },
+      ),
+      deno::deno_websocket::deno_websocket::init_ops_and_esm::<Permissions>(
+        user_agent, None, None,
+      ),
+      // TODO: support providing a custom seed for crypto
+      deno::deno_crypto::deno_crypto::init_ops_and_esm(None),
+      deno::deno_net::deno_net::init_ops_and_esm::<Permissions>(None, None),
+      deno::deno_tls::deno_tls::init_ops_and_esm(),
+      deno::deno_http::deno_http::init_ops_and_esm::<
+        DefaultHttpPropertyExtractor,
+      >(deno::deno_http::Options::default()),
+      deno::deno_io::deno_io::init_ops_and_esm(Some(Default::default())),
+      deno::deno_fs::deno_fs::init_ops_and_esm::<Permissions>(fs.clone()),
+      ext_env::env::init_ops_and_esm(),
+      ext_os::os::init_ops_and_esm(),
+      ext_runtime::runtime_bootstrap::init_ops::<PermissionsContainer>(None),
+      ext_runtime::runtime_net::init_ops_and_esm(),
+      ext_runtime::runtime_http::init_ops_and_esm(),
+      ext_runtime::runtime_http_start::init_ops_and_esm(),
+      ext_runtime::runtime_node_compat::init_ops_and_esm(),
+      ext_node::deno_node::init_ops_and_esm::<Permissions>(None, fs),
+      deno::runtime::ops::permissions::deno_permissions::init_ops(),
+      ext_runtime::runtime::init_ops(),
+      ext_runtime::runtime_e2b::init_ops_and_esm(),
+    ];
+
+    write_runtime_snapshot(
+      snapshot_path,
+      Some(extension_manifest_path),
+      extensions,
+    );
+  }
+
+  fn write_runtime_snapshot(
+    snapshot_path: PathBuf,
+    extension_manifest_path: Option<PathBuf>,
+    extensions: Vec<Extension>,
+  ) {
+    if let Some(path) = extension_manifest_path {
+      let mut manifest = std::fs::File::create(path).unwrap();
+      writeln!(
+        manifest,
+        "pub const E2B_SNAPSHOT_EXTENSION_NAMES: &[&str] = &["
+      )
+      .unwrap();
+      for extension in &extensions {
+        writeln!(manifest, "  {:?},", extension.name).unwrap();
+      }
+      writeln!(manifest, "];").unwrap();
+    }
 
     let snapshot = create_snapshot(
       CreateSnapshotOptions {
@@ -330,7 +406,12 @@ fn main() {
   // Main snapshot
   let runtime_snapshot_path = o.join("RUNTIME_SNAPSHOT.bin");
 
-  supabase_startup_snapshot::create_runtime_snapshot(
-    runtime_snapshot_path.clone(),
+  supabase_startup_snapshot::create_runtime_snapshot(runtime_snapshot_path);
+
+  let e2b_runtime_snapshot_path = o.join("RUNTIME_SNAPSHOT_E2B.bin");
+  let e2b_extension_manifest_path = o.join("e2b_snapshot_extensions.rs");
+  supabase_startup_snapshot::create_e2b_runtime_snapshot(
+    e2b_runtime_snapshot_path,
+    e2b_extension_manifest_path,
   );
 }

@@ -77,6 +77,8 @@ deno_core::extension!(
     op_user_worker_fetch_build,
     op_user_worker_fetch_send,
     op_user_worker_cleanup_idle_workers,
+    op_user_worker_terminate,
+    op_user_worker_wait_for_shutdown,
     op_user_worker_mem_stats,
   ],
   esm_entry_point = "ext:user_workers/user_workers.js",
@@ -114,6 +116,8 @@ pub struct UserWorkerCreateOptions {
   no_npm: Option<bool>,
 
   force_create: bool,
+  #[serde(default)]
+  runtime_profile: context::UserWorkerRuntimeProfile,
   allow_remote_modules: bool,
   custom_module_root: Option<String>,
   permissions: Option<JsPermissionsOptions>,
@@ -196,10 +200,17 @@ impl JsPermissionsOptions {
 pub async fn op_user_worker_create(
   state: Rc<RefCell<OpState>>,
   #[serde] opts: UserWorkerCreateOptions,
-) -> Result<(String, bool), AnyError> {
+) -> Result<CreateUserWorkerResult, AnyError> {
   let result_rx = {
-    let op_state = state.borrow();
-    let tx = op_state.borrow::<mpsc::UnboundedSender<UserWorkerMsgs>>();
+    let tx = state
+      .borrow()
+      .try_borrow::<mpsc::UnboundedSender<UserWorkerMsgs>>()
+      .cloned()
+      .ok_or_else(|| {
+        anyhow::anyhow!(
+          "user worker management is only available to the main worker"
+        )
+      })?;
     let (result_tx, result_rx) =
       oneshot::channel::<Result<CreateUserWorkerResult, Error>>();
 
@@ -210,6 +221,7 @@ pub async fn op_user_worker_create(
       no_npm,
 
       force_create,
+      runtime_profile,
       allow_remote_modules,
       custom_module_root,
       permissions,
@@ -264,6 +276,7 @@ pub async fn op_user_worker_create(
             .unwrap_or(DEFAULT.cpu_time_hard_limit_ms),
 
           force_create,
+          runtime_profile,
           allow_remote_modules,
           custom_module_root,
           permissions: permissions
@@ -313,7 +326,7 @@ pub async fn op_user_worker_create(
     Ok(Err(err)) => {
       Err(custom_error("InvalidWorkerCreation", format!("{err:#}")))
     }
-    Ok(Ok(v)) => Ok((v.key.to_string(), v.reused)),
+    Ok(Ok(v)) => Ok(v),
   }
 }
 
@@ -695,23 +708,80 @@ pub async fn op_user_worker_fetch_send(
 pub async fn op_user_worker_cleanup_idle_workers(
   state: Rc<RefCell<OpState>>,
   #[number] timeout_ms: usize,
-) -> usize {
-  let msg_tx = {
-    state
-      .borrow()
-      .borrow::<mpsc::UnboundedSender<UserWorkerMsgs>>()
-      .clone()
-  };
+) -> Result<usize, Error> {
+  let msg_tx = state
+    .borrow()
+    .try_borrow::<mpsc::UnboundedSender<UserWorkerMsgs>>()
+    .cloned()
+    .ok_or_else(|| {
+      anyhow::anyhow!(
+        "user worker management is only available to the main worker"
+      )
+    })?;
 
   let (tx, rx) = oneshot::channel();
   if msg_tx
     .send(UserWorkerMsgs::TryCleanupIdleWorkers(timeout_ms, tx))
     .is_err()
   {
-    return 0;
+    return Ok(0);
   }
 
-  (rx.await).unwrap_or_default()
+  Ok((rx.await).unwrap_or_default())
+}
+
+#[op2(async)]
+pub async fn op_user_worker_terminate(
+  state: Rc<RefCell<OpState>>,
+  #[string] key: String,
+) -> Result<bool, Error> {
+  let key = Uuid::parse_str(&key)?;
+  let msg_tx = state
+    .borrow()
+    .try_borrow::<mpsc::UnboundedSender<UserWorkerMsgs>>()
+    .cloned()
+    .ok_or_else(|| {
+      anyhow::anyhow!(
+        "user worker management is only available to the main worker"
+      )
+    })?;
+
+  let (tx, rx) = oneshot::channel();
+  if msg_tx.send(UserWorkerMsgs::Terminate(key, tx)).is_err() {
+    return Ok(false);
+  }
+
+  Ok(rx.await.unwrap_or(false))
+}
+
+#[op2(async)]
+#[serde]
+pub async fn op_user_worker_wait_for_shutdown(
+  state: Rc<RefCell<OpState>>,
+  #[string] key: String,
+) -> Result<Option<crate::context::WorkerShutdown>, Error> {
+  let key = Uuid::parse_str(&key)?;
+  let msg_tx = {
+    let op_state = state.borrow();
+    op_state
+      .try_borrow::<mpsc::UnboundedSender<UserWorkerMsgs>>()
+      .cloned()
+      .ok_or_else(|| {
+        anyhow::anyhow!(
+          "user worker management is only available to the main worker"
+        )
+      })?
+  };
+
+  let (tx, rx) = oneshot::channel();
+  if msg_tx
+    .send(UserWorkerMsgs::WaitForShutdown(key, tx))
+    .is_err()
+  {
+    return Ok(None);
+  }
+
+  Ok(rx.await.unwrap_or(None))
 }
 
 #[op2(async)]
@@ -720,8 +790,15 @@ pub async fn op_user_worker_mem_stats(
   state: Rc<RefCell<OpState>>,
 ) -> Result<HashMap<Uuid, WorkerHeapStatisticsWithServicePath>, Error> {
   let mem_rx = {
-    let op_state = state.borrow();
-    let tx = op_state.borrow::<mpsc::UnboundedSender<UserWorkerMsgs>>();
+    let tx = state
+      .borrow()
+      .try_borrow::<mpsc::UnboundedSender<UserWorkerMsgs>>()
+      .cloned()
+      .ok_or_else(|| {
+        anyhow::anyhow!(
+          "user worker management is only available to the main worker"
+        )
+      })?;
 
     let (mem_tx, mem_rx) = oneshot::channel();
     let _ = tx.send(UserWorkerMsgs::InqueryMemoryUsage(mem_tx));

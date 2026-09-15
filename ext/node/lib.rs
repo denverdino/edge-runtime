@@ -35,6 +35,11 @@ pub use ops::vm::create_v8_context;
 pub use ops::vm::init_global_template;
 pub use ops::vm::ContextInitMode;
 pub use ops::vm::VM_CONTEXT_INDEX;
+/// When present and true, `node:vm` ops skip the `check_run_all` permission
+/// gate. Set per worker so sandbox executors can use `vm` without being
+/// granted process-spawn permission.
+#[derive(Debug, Clone, Copy)]
+pub struct AllowNodeVm(pub bool);
 pub use polyfill::is_builtin_node_module;
 pub use polyfill::SUPPORTED_BUILTIN_NODE_MODULES;
 pub use polyfill::SUPPORTED_BUILTIN_NODE_MODULES_WITH_PREFIX;

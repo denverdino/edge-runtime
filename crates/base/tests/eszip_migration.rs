@@ -156,7 +156,7 @@ where
     let token = termination_token.clone();
     async move {
       while let Some(msg) = pool_msg_rx.recv().await {
-        if matches!(msg, UserWorkerMsgs::Shutdown(_)) {
+        if matches!(msg, UserWorkerMsgs::Shutdown(_, _)) {
           token.outbound.cancel();
           break;
         }

@@ -18,6 +18,8 @@ const {
   op_user_worker_fetch_send,
   op_user_worker_create,
   op_user_worker_cleanup_idle_workers,
+  op_user_worker_terminate,
+  op_user_worker_wait_for_shutdown,
   op_user_worker_mem_stats,
 } = ops;
 
@@ -35,8 +37,25 @@ function redirectStatus(status) {
 }
 
 class UserWorker {
-  constructor(key) {
+  constructor(
+    key,
+    runtimeInitMs = 0,
+    moduleInitMs = 0,
+    runtimeInit = {
+      loaderVfsMs: 0,
+      resourceLimitsMs: 0,
+      jsRuntimeNewMs: 0,
+      bootstrapMs: 0,
+      bootstrapBlockingRunMs: 0,
+      bootstrapBlockingQueueMs: 0,
+      postSetupBlockingRunMs: 0,
+      postSetupBlockingQueueMs: 0,
+    },
+  ) {
     this.key = key;
+    this.runtimeInitMs = runtimeInitMs;
+    this.moduleInitMs = moduleInitMs;
+    this.runtimeInit = runtimeInit;
   }
 
   async fetch(request, options = {}) {
@@ -128,6 +147,14 @@ class UserWorker {
     });
   }
 
+  async terminate() {
+    return await op_user_worker_terminate(this.key);
+  }
+
+  async waitForShutdown() {
+    return await op_user_worker_wait_for_shutdown(this.key);
+  }
+
   static async create(opts) {
     const readyOptions = {
       noModuleCache: false,
@@ -153,12 +180,13 @@ class UserWorker {
       enterSpan(span);
     }
     try {
-      const [key, reused] = await op_user_worker_create(readyOptions);
+      const { key, reused, runtimeInitMs, moduleInitMs, runtimeInit } =
+        await op_user_worker_create(readyOptions);
       if (TRACING_ENABLED) {
         span.setAttribute("worker.id", key);
         span.setAttribute("worker.reused", reused);
       }
-      return new UserWorker(key);
+      return new UserWorker(key, runtimeInitMs, moduleInitMs, runtimeInit);
     } catch (err) {
       if (TRACING_ENABLED) {
         try {

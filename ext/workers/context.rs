@@ -60,14 +60,36 @@ impl WorkerExit {
   }
 }
 
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  Default,
+  PartialEq,
+  Eq,
+  serde::Serialize,
+  serde::Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum UserWorkerRuntimeProfile {
+  #[default]
+  Standard,
+  E2bExecutor,
+}
+
 #[derive(Debug, Clone)]
 pub struct UserWorkerRuntimeOpts {
   pub service_path: Option<String>,
+  pub runtime_profile: UserWorkerRuntimeProfile,
   pub key: Option<Uuid>,
 
   pub pool_msg_tx: Option<mpsc::UnboundedSender<UserWorkerMsgs>>,
   pub events_msg_tx: Option<mpsc::UnboundedSender<WorkerEventWithMetadata>>,
+  /// Raised *by* the supervisor once it stops processing requests.
   pub cancel: Option<CancellationToken>,
+  /// Cancelled *to* ask the supervisor to terminate the isolate. When `None`,
+  /// the supervisor creates its own token, so nothing can request termination.
+  pub supervise_cancel: Option<CancellationToken>,
 
   pub memory_limit_mb: u64,
   pub low_memory_multiplier: u64,
@@ -96,11 +118,13 @@ impl Default for UserWorkerRuntimeOpts {
   fn default() -> UserWorkerRuntimeOpts {
     UserWorkerRuntimeOpts {
       service_path: None,
+      runtime_profile: UserWorkerRuntimeProfile::Standard,
       key: None,
 
       pool_msg_tx: None,
       events_msg_tx: None,
       cancel: None,
+      supervise_cancel: None,
 
       memory_limit_mb: env!("SUPABASE_RESOURCE_LIMIT_MEM_MB").parse().unwrap(),
       low_memory_multiplier: env!("SUPABASE_RESOURCE_LIMIT_LOW_MEM_MULTIPLIER")
@@ -148,7 +172,11 @@ pub struct UserWorkerProfile {
   ),
   pub service_path: String,
   pub permit: Option<Arc<OwnedSemaphorePermit>>,
+  /// Raised *by* the supervisor once it stops processing requests, so in-flight
+  /// requests fail fast. Cancelling it does not terminate the isolate.
   pub cancel: CancellationToken,
+  /// Cancelled *to* ask the supervisor to terminate the isolate.
+  pub supervise_cancel: CancellationToken,
   pub status: TimingStatus,
   pub exit: WorkerExit,
   pub mem_check: Arc<RwLock<MemCheckState>>,
@@ -273,6 +301,23 @@ pub struct WorkerContextInitOpts {
   pub maybe_otel_config: Option<OtelConfig>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerShutdownMemory {
+  pub total: usize,
+  pub heap: usize,
+  pub external: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerShutdown {
+  pub reason: String,
+  pub cpu_time_used: usize,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub memory_used: Option<WorkerShutdownMemory>,
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // This is a low-frequency control channel; avoid API churn.
 pub enum UserWorkerMsgs {
@@ -288,7 +333,9 @@ pub enum UserWorkerMsgs {
     Option<CancellationToken>,
   ),
   Idle(Uuid),
-  Shutdown(Uuid),
+  Shutdown(Uuid, WorkerShutdown),
+  Terminate(Uuid, oneshot::Sender<bool>),
+  WaitForShutdown(Uuid, oneshot::Sender<Option<WorkerShutdown>>),
   TryCleanupIdleWorkers(usize, oneshot::Sender<usize>),
   InqueryMemoryUsage(
     oneshot::Sender<HashMap<Uuid, WorkerHeapStatisticsWithServicePath>>,
@@ -297,10 +344,27 @@ pub enum UserWorkerMsgs {
 
 pub type SendRequestResult = (Response<Body>, mpsc::UnboundedSender<()>);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeInitTimings {
+  pub loader_vfs_ms: u64,
+  pub resource_limits_ms: u64,
+  pub js_runtime_new_ms: u64,
+  pub bootstrap_ms: u64,
+  pub bootstrap_blocking_run_ms: u64,
+  pub bootstrap_blocking_queue_ms: u64,
+  pub post_setup_blocking_run_ms: u64,
+  pub post_setup_blocking_queue_ms: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateUserWorkerResult {
   pub key: Uuid,
   pub reused: bool,
+  pub runtime_init_ms: u64,
+  pub module_init_ms: u64,
+  pub runtime_init: RuntimeInitTimings,
 }
 
 #[derive(Debug)]

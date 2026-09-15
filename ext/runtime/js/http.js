@@ -1,7 +1,7 @@
 import "ext:deno_http/01_http.js";
 
 import { core, internals, primordials } from "ext:core/mod.js";
-import { enterRequestContext } from "ext:runtime/request_context.js";
+import { enterRequestContext } from "./request_context.js";
 import { RequestPrototype } from "ext:deno_fetch/23_request.js";
 import {
   fromInnerResponse,
@@ -9,7 +9,7 @@ import {
   ResponsePrototype,
 } from "ext:deno_fetch/23_response.js";
 import { upgradeWebSocket } from "ext:deno_http/02_websocket.ts";
-import { HttpConn } from "ext:runtime/01_http.js";
+import { HttpConn } from "./01_http.js";
 import {
   builtinTracer,
   ContextManager,

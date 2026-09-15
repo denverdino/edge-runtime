@@ -3324,6 +3324,7 @@ dependencies = [
  "base_rt",
  "bytes",
  "dashmap",
+ "deno_ast",
  "deno_core",
  "deno_fetch",
  "deno_fs",

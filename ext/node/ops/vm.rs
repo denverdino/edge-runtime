@@ -8,12 +8,29 @@ use deno_core::v8::MapFnTo;
 use deno_core::JsBuffer;
 use deno_core::OpState;
 use deno_permissions::PermissionsContainer;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 pub const PRIVATE_SYMBOL_NAME: v8::OneByteConst =
   v8::String::create_external_onebyte_const(b"node:contextify:context");
+
+fn vm_permitted(state: &mut OpState) -> bool {
+  if state
+    .try_borrow::<crate::AllowNodeVm>()
+    .map(|it| it.0)
+    .unwrap_or(false)
+  {
+    return true;
+  }
+
+  state
+    .borrow_mut::<PermissionsContainer>()
+    .check_run_all("node:vm")
+    .is_ok()
+}
 
 /// An unbounded script that can be run in a context.
 pub struct ContextifyScript {
@@ -1053,7 +1070,7 @@ fn indexed_property_deleter<'s>(
 #[serde]
 pub fn op_vm_create_script<'a>(
   scope: &mut v8::HandleScope<'a>,
-  state: &mut OpState,
+  state: Rc<RefCell<OpState>>,
   source: v8::Local<'a, v8::String>,
   filename: v8::Local<'a, v8::Value>,
   line_offset: i32,
@@ -1062,11 +1079,7 @@ pub fn op_vm_create_script<'a>(
   produce_cached_data: bool,
   parsing_context: Option<v8::Local<'a, v8::Object>>,
 ) -> Option<CompileResult<'a>> {
-  if state
-    .borrow_mut::<PermissionsContainer>()
-    .check_run_all("node:vm")
-    .is_err()
-  {
+  if !vm_permitted(&mut state.borrow_mut()) {
     return None;
   }
 
@@ -1085,19 +1098,20 @@ pub fn op_vm_create_script<'a>(
 #[op2(reentrant)]
 pub fn op_vm_script_run_in_context<'a>(
   scope: &mut v8::HandleScope<'a>,
-  state: &mut OpState,
+  state: Rc<RefCell<OpState>>,
   #[cppgc] script: &ContextifyScript,
   sandbox: Option<v8::Local<'a, v8::Object>>,
   #[serde] timeout: i64,
   display_errors: bool,
   break_on_sigint: bool,
 ) -> Option<v8::Local<'a, v8::Value>> {
-  if state
-    .borrow_mut::<PermissionsContainer>()
-    .check_run_all("node:vm")
-    .is_err()
+  // The borrow must end before user code runs: this op is reentrant, and a
+  // nested op that re-borrows OpState would otherwise hit a BorrowMutError
+  // inside a function that cannot unwind, aborting the whole process.
   {
-    return None;
+    if !vm_permitted(&mut state.borrow_mut()) {
+      return None;
+    }
   }
 
   script.run_in_context(
@@ -1113,7 +1127,7 @@ pub fn op_vm_script_run_in_context<'a>(
 #[op2(fast)]
 pub fn op_vm_create_context(
   scope: &mut v8::HandleScope,
-  state: &mut OpState,
+  state: Rc<RefCell<OpState>>,
   sandbox_obj: v8::Local<v8::Object>,
   #[string] name: String,
   #[string] origin: String,
@@ -1121,11 +1135,7 @@ pub fn op_vm_create_context(
   allow_code_gen_wasm: bool,
   own_microtask_queue: bool,
 ) {
-  if state
-    .borrow_mut::<PermissionsContainer>()
-    .check_run_all("node:vm")
-    .is_err()
-  {
+  if !vm_permitted(&mut state.borrow_mut()) {
     return;
   }
 
@@ -1152,9 +1162,12 @@ pub fn op_vm_is_context(
   state: &mut OpState,
   sandbox_obj: v8::Local<v8::Value>,
 ) -> Result<bool, deno_core::error::AnyError> {
-  state
-    .borrow_mut::<PermissionsContainer>()
-    .check_run_all("node:vm")?;
+  if !vm_permitted(state) {
+    return Err(deno_core::error::custom_error(
+      "NotCapable",
+      "Requires run access to \"node:vm\"",
+    ));
+  }
 
   Ok(
     sandbox_obj
@@ -1190,11 +1203,7 @@ pub fn op_vm_compile_function<'s>(
   context_extensions: Option<v8::Local<'s, v8::Array>>,
   params: Option<v8::Local<'s, v8::Array>>,
 ) -> Option<CompileResult<'s>> {
-  if state
-    .borrow_mut::<PermissionsContainer>()
-    .check_run_all("node:vm")
-    .is_err()
-  {
+  if !vm_permitted(state) {
     return None;
   }
 
@@ -1314,9 +1323,12 @@ pub fn op_vm_script_get_source_map_url<'s>(
   state: &mut OpState,
   #[cppgc] script: &ContextifyScript,
 ) -> Result<v8::Local<'s, v8::Value>, deno_core::error::AnyError> {
-  state
-    .borrow_mut::<PermissionsContainer>()
-    .check_run_all("node:vm")?;
+  if !vm_permitted(state) {
+    return Err(deno_core::error::custom_error(
+      "NotCapable",
+      "Requires run access to \"node:vm\"",
+    ));
+  }
 
   let unbound_script = script.script.get(scope).unwrap();
   Ok(unbound_script.get_source_mapping_url(scope))
@@ -1328,9 +1340,12 @@ pub fn op_vm_script_create_cached_data<'s>(
   state: &mut OpState,
   #[cppgc] script: &ContextifyScript,
 ) -> Result<v8::Local<'s, v8::Value>, deno_core::error::AnyError> {
-  state
-    .borrow_mut::<PermissionsContainer>()
-    .check_run_all("node:vm")?;
+  if !vm_permitted(state) {
+    return Err(deno_core::error::custom_error(
+      "NotCapable",
+      "Requires run access to \"node:vm\"",
+    ));
+  }
 
   let unbound_script = script.script.get(scope).unwrap();
   let data = match unbound_script.create_code_cache() {

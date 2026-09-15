@@ -60,6 +60,26 @@ docker run -it --rm -p 9000:9000 -v ./examples/:/examples supabase/edge-runtime 
   modules to match to the selected tag of Deno.
 - Update the contents of `ext/node/` to match the contents of
   `deno@selected-tag/ext/node`.
+- Re-apply the four `ext/node` fork changes after replacing `ext/node/`. All are
+  reachable from any `vm` context, so losing one reintroduces a process-level
+  crash rather than a degraded feature:
+  1. `ext/node/lib.rs` — the per-worker `AllowNodeVm` OpState marker, set by
+     `userWorkers.create({ context: { allowNodeVm: true } })`, which lets
+     sandbox workers use vm without `allow_run`.
+  2. `ext/node/ops/vm.rs` — every vm permission gate routes through
+     `vm_permitted()`, honoring that marker before falling back to upstream's
+     `check_run_all("node:vm")`. `op_vm_script_run_in_context` **must** take
+     `Rc<RefCell<OpState>>` and drop the permission borrow **before** running
+     user code: restoring `&mut OpState` holds the borrow across user code, so
+     any nested op that re-borrows it — for example `deno_url`'s `op_url_parse`,
+     reached by `new URL(...)` — aborts the whole process with a non-unwinding
+     `BorrowMutError`.
+  3. `ext/node/polyfill.rs` — keep `"vm"` in `SUPPORTED_BUILTIN_NODE_MODULES` so
+     the polyfill can be imported.
+  4. `ext/node/global.rs` — the interceptors use the graceful
+     `current_globals()` rather than
+     `context.get_slot::<GlobalsStorage>().unwrap()`. That `unwrap` is reachable
+     from a vm context and panics inside a non-unwinding V8 callback.
 
 ## How to use Dev Container
 

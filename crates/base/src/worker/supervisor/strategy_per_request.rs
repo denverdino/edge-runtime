@@ -114,8 +114,13 @@ pub async fn supervise(
 
   loop {
     tokio::select! {
+      // NOTE: Must fall through to the termination dispatch below instead of
+      // returning here, otherwise the isolate keeps running unsupervised after
+      // `WorkerPool::terminate` cancels this token. When the canceller is the
+      // driver's own drop guard the isolate is already gone, and
+      // `request_interrupt` reports that by returning false.
       _ = supervise.cancelled() => {
-          return (ShutdownReason::TerminationRequested, cpu_usage_ms);
+          complete_reason = Some(ShutdownReason::TerminationRequested);
       }
 
       _ = async {

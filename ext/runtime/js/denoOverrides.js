@@ -5,9 +5,9 @@ import * as fs from "ext:deno_fs/30_fs.js";
 import { createHttpClient } from "ext:deno_fetch/22_http_client.js";
 import { osCalls } from "ext:os/os.js";
 import * as io from "ext:deno_io/12_io.js";
-import * as permissions from "ext:runtime/permissions.js";
-import { errors } from "ext:runtime/errors.js";
-import { serve, serveHttp, upgradeWebSocket } from "ext:runtime/http.js";
+import * as permissions from "./permissions.js";
+import { errors } from "./errors.js";
+import { serve, serveHttp, upgradeWebSocket } from "./http.js";
 
 const osCallsVars = {
   gid: osCalls.gid,

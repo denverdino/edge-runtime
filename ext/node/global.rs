@@ -268,6 +268,16 @@ fn current_mode(scope: &mut v8::HandleScope) -> Mode {
   }
 }
 
+fn current_globals(
+  scope: &mut v8::HandleScope,
+) -> Option<v8::Global<v8::Object>> {
+  let mode = current_mode(scope);
+  let context = scope.get_current_context();
+  context
+    .get_slot::<GlobalsStorage>()
+    .map(|storage| storage.inner_for_mode(mode))
+}
+
 pub fn getter<'s>(
   scope: &mut v8::HandleScope<'s>,
   key: v8::Local<'s, v8::Name>,
@@ -279,12 +289,8 @@ pub fn getter<'s>(
   };
 
   let this = args.this();
-  let mode = current_mode(scope);
-
-  let context = scope.get_current_context();
-  let inner = {
-    let storage = context.get_slot::<GlobalsStorage>().unwrap();
-    storage.inner_for_mode(mode)
+  let Some(inner) = current_globals(scope) else {
+    return v8::Intercepted::No;
   };
   let inner = v8::Local::new(scope, inner);
 
@@ -312,12 +318,8 @@ pub fn setter<'s>(
   };
 
   let this = args.this();
-  let mode = current_mode(scope);
-
-  let context = scope.get_current_context();
-  let inner = {
-    let storage = context.get_slot::<GlobalsStorage>().unwrap();
-    storage.inner_for_mode(mode)
+  let Some(inner) = current_globals(scope) else {
+    return v8::Intercepted::No;
   };
   let inner = v8::Local::new(scope, inner);
 
@@ -339,12 +341,8 @@ pub fn query<'s>(
   if !is_managed_key(scope, key) {
     return v8::Intercepted::No;
   };
-  let mode = current_mode(scope);
-
-  let context = scope.get_current_context();
-  let inner = {
-    let storage = context.get_slot::<GlobalsStorage>().unwrap();
-    storage.inner_for_mode(mode)
+  let Some(inner) = current_globals(scope) else {
+    return v8::Intercepted::No;
   };
   let inner = v8::Local::new(scope, inner);
 
@@ -371,12 +369,8 @@ pub fn deleter<'s>(
     return v8::Intercepted::No;
   };
 
-  let mode = current_mode(scope);
-
-  let context = scope.get_current_context();
-  let inner = {
-    let storage = context.get_slot::<GlobalsStorage>().unwrap();
-    storage.inner_for_mode(mode)
+  let Some(inner) = current_globals(scope) else {
+    return v8::Intercepted::No;
   };
   let inner = v8::Local::new(scope, inner);
 
@@ -400,12 +394,8 @@ pub fn enumerator<'s>(
   _args: v8::PropertyCallbackArguments<'s>,
   mut rv: v8::ReturnValue<v8::Array>,
 ) {
-  let mode = current_mode(scope);
-
-  let context = scope.get_current_context();
-  let inner = {
-    let storage = context.get_slot::<GlobalsStorage>().unwrap();
-    storage.inner_for_mode(mode)
+  let Some(inner) = current_globals(scope) else {
+    return;
   };
   let inner = v8::Local::new(scope, inner);
 
@@ -434,12 +424,8 @@ pub fn definer<'s>(
     return v8::Intercepted::No;
   };
 
-  let mode = current_mode(scope);
-
-  let context = scope.get_current_context();
-  let inner = {
-    let storage = context.get_slot::<GlobalsStorage>().unwrap();
-    storage.inner_for_mode(mode)
+  let Some(inner) = current_globals(scope) else {
+    return v8::Intercepted::No;
   };
   let inner = v8::Local::new(scope, inner);
 
@@ -466,14 +452,10 @@ pub fn descriptor<'s>(
     return v8::Intercepted::No;
   };
 
-  let mode = current_mode(scope);
-
   let scope = &mut v8::TryCatch::new(scope);
 
-  let context = scope.get_current_context();
-  let inner = {
-    let storage = context.get_slot::<GlobalsStorage>().unwrap();
-    storage.inner_for_mode(mode)
+  let Some(inner) = current_globals(scope) else {
+    return v8::Intercepted::No;
   };
   let inner = v8::Local::new(scope, inner);
 

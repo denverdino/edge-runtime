@@ -1,4 +1,5 @@
 import * as console from "ext:deno_console/01_console.js";
+import "./40_process.js";
 
 const {
   ObjectPrototypeIsPrototypeOf,

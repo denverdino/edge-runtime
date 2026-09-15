@@ -31,6 +31,7 @@ function installEdgeRuntimeNamespace(kind, terminationRequestTokenRid) {
         userWorkers: SUPABASE_USER_WORKERS,
         getRuntimeMetrics: () => /* async */ ops.op_runtime_metrics(),
         applySupabaseTag: (src, dest) => applySupabaseTag(src, dest),
+        bundle: (entrypoint) => ops.op_bundle_service(entrypoint),
         systemMemoryInfo: () => ops.op_system_memory_info(),
         raiseSegfault: () => ops.op_raise_segfault(),
         miCollect: () => ops.op_mi_collect(),
@@ -51,6 +52,8 @@ function installEdgeRuntimeNamespace(kind, terminationRequestTokenRid) {
     case "user":
       props = {
         waitUntil,
+        transpile: (source, filename) =>
+          ops.op_transpile_ts(source, filename ?? "snippet.ts"),
       };
       break;
   }

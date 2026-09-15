@@ -144,7 +144,8 @@ pub fn create_supervisor(
   let runtime_drop_token = runtime.drop_token.clone();
 
   let giveup_process_requests_token = cancel.clone();
-  let supervise_cancel_token = CancellationToken::new();
+  let supervise_cancel_token =
+    conf.supervise_cancel.clone().unwrap_or_default();
   let tokens = Tokens {
     termination: termination_token.clone(),
     supervise: supervise_cancel_token.clone(),

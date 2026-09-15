@@ -83,7 +83,7 @@ generate_builtin_node_module_lists! {
   "util",
   "util/types",
   "v8",
-  // "vm",
+  "vm",
   "wasi",
   "worker_threads",
   "zlib",

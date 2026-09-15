@@ -81,6 +81,7 @@ interface UserWorkerCreateOptions {
   noNpm?: boolean | null;
 
   forceCreate?: boolean | null;
+  runtimeProfile?: "standard" | "e2bExecutor" | null;
   allowRemoteModules?: boolean | null;
   customModuleRoot?: string | null;
   permissions?: PermissionsOptions | null;
@@ -157,6 +158,30 @@ interface WorkerHeapStatisticsWithServicePath {
   stats?: HeapStatistics;
 }
 
+type WorkerShutdownReason =
+  | "EventLoopCompleted"
+  | "WallClockTime"
+  | "CPUTime"
+  | "Memory"
+  | "EarlyDrop"
+  | "TerminationRequested"
+  | "UncaughtException"
+  | "UnexpectedError"
+  | "SupervisorUnavailable"
+  | "Unknown";
+
+interface WorkerShutdownMemory {
+  total: number;
+  heap: number;
+  external: number;
+}
+
+interface WorkerShutdown {
+  reason: WorkerShutdownReason;
+  cpuTimeUsed: number;
+  memoryUsed?: WorkerShutdownMemory;
+}
+
 interface RuntimeMetrics {
   mainWorkerHeapStats: HeapStatistics;
   eventWorkerHeapStats?: HeapStatistics;
@@ -176,6 +201,17 @@ interface MemInfo {
   swapFree: number;
 }
 
+interface RuntimeInitTimings {
+  loaderVfsMs: number;
+  resourceLimitsMs: number;
+  jsRuntimeNewMs: number;
+  bootstrapMs: number;
+  bootstrapBlockingRunMs: number;
+  bootstrapBlockingQueueMs: number;
+  postSetupBlockingRunMs: number;
+  postSetupBlockingQueueMs: number;
+}
+
 declare namespace EdgeRuntime {
   export namespace ai {
     function tryCleanupUnusedSession(): Promise<number>;
@@ -189,6 +225,19 @@ declare namespace EdgeRuntime {
       options?: UserWorkerFetchOptions,
     ): Promise<Response>;
 
+    /** Requests immediate termination. Resolves false if it was already gone. */
+    terminate(): Promise<boolean>;
+    /** Resolves after runtime and supervisor shutdown, or null if unavailable. */
+    waitForShutdown(): Promise<WorkerShutdown | null>;
+    /** The worker's pool key. */
+    readonly key: string;
+    /** Fresh DenoRuntime initialization duration for this create call. */
+    readonly runtimeInitMs: number;
+    /** Fresh eager main-module initialization duration for this create call. */
+    readonly moduleInitMs: number;
+    /** Fresh DenoRuntime initialization phases for this create call. */
+    readonly runtimeInit: RuntimeInitTimings;
+
     static create(opts: UserWorkerCreateOptions): Promise<UserWorker>;
     static tryCleanupIdleWorkers(timeoutMs: number): Promise<number>;
     static memStats(): Promise<
@@ -198,8 +247,22 @@ declare namespace EdgeRuntime {
 
   export function scheduleTermination(): void;
   export function waitUntil<T>(promise: Promise<T>): Promise<T>;
+  /**
+   * Asynchronously transpiles TypeScript to JavaScript by stripping types.
+   * Does not type-check or execute the code and requires an opted-in worker.
+   */
+  export function transpile(
+    source: string,
+    filename?: string,
+  ): Promise<string>;
   export function getRuntimeMetrics(): Promise<RuntimeMetrics>;
   export function applySupabaseTag(src: Request, dest: Request): void;
+  /**
+   * Resolves and transpiles a service entrypoint into eszip bytes, for reuse as
+   * {@link UserWorkerCreateOptions.maybeEszip}. Main worker only: a user worker
+   * could otherwise read arbitrary module graphs from the host filesystem.
+   */
+  export function bundle(entrypoint: string): Promise<Uint8Array>;
   export function systemMemoryInfo(): MemInfo;
   export function raiseSegfault(): void;
   export function miCollect(): void;

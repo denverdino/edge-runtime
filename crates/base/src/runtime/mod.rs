@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::task::Poll;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use anyhow::bail;
@@ -60,6 +61,7 @@ use deno_core::v8::GCType;
 use deno_core::v8::HeapStatistics;
 use deno_core::v8::Isolate;
 use deno_core::v8::Locker;
+use deno_core::Extension;
 use deno_core::JsRuntime;
 use deno_core::ModuleId;
 use deno_core::ModuleLoader;
@@ -85,7 +87,9 @@ use ext_event_worker::events::WorkerEventWithMetadata;
 use ext_runtime::external_memory::CustomAllocator;
 use ext_runtime::MemCheckWaker;
 use ext_runtime::PromiseMetrics;
+use ext_workers::context::RuntimeInitTimings;
 use ext_workers::context::UserWorkerMsgs;
+use ext_workers::context::UserWorkerRuntimeProfile;
 use ext_workers::context::WorkerContextInitOpts;
 use ext_workers::context::WorkerKind;
 use ext_workers::context::WorkerRuntimeOpts;
@@ -155,6 +159,84 @@ pub static MAIN_WORKER_INITIAL_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
 pub static MAIN_WORKER_MAX_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
 pub static EVENT_WORKER_INITIAL_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
 pub static EVENT_WORKER_MAX_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
+
+fn e2b_runtime_extensions(
+  project_ref: Option<&str>,
+  root_cert_store_provider: Arc<dyn deno_tls::RootCertStoreProvider>,
+  stdio: deno_io::Stdio,
+  fs: deno_fs::FileSystemRc,
+  main_module_url: ModuleSpecifier,
+  node_services: Option<ext_node::NodeExtInitServices>,
+) -> Vec<Extension> {
+  vec![
+    deno_telemetry::deno_telemetry::init_ops(),
+    deno_webidl::deno_webidl::init_ops(),
+    deno_console::deno_console::init_ops(),
+    deno_url::deno_url::init_ops(),
+    deno_web::deno_web::init_ops::<PermissionsContainer>(
+      Arc::new(deno_web::BlobStore::default()),
+      None,
+    ),
+    deno_fetch::deno_fetch::init_ops::<PermissionsContainer>(
+      deno_fetch::Options {
+        user_agent: deno::versions::user_agent(project_ref),
+        request_builder_hook: project_ref
+          .map(|it| deno::versions::user_agent_comment(Some(it)))
+          .and_then(|it| user_agent::stamping_hook(&it)),
+        root_cert_store_provider: Some(root_cert_store_provider.clone()),
+        file_fetch_handler: Rc::new(deno_fetch::FsFetchHandler),
+        ..Default::default()
+      },
+    ),
+    deno_websocket::deno_websocket::init_ops::<PermissionsContainer>(
+      deno::versions::user_agent(project_ref),
+      Some(root_cert_store_provider.clone()),
+      None,
+    ),
+    // TODO: support providing a custom seed for crypto
+    deno_crypto::deno_crypto::init_ops(None),
+    deno_net::deno_net::init_ops::<PermissionsContainer>(
+      Some(root_cert_store_provider),
+      None,
+    ),
+    deno_tls::deno_tls::init_ops(),
+    deno_http::deno_http::init_ops::<DefaultHttpPropertyExtractor>(
+      deno_http::Options::default(),
+    ),
+    deno_io::deno_io::init_ops(Some(stdio)),
+    deno_fs::deno_fs::init_ops::<PermissionsContainer>(fs.clone()),
+    ext_env::env::init_ops(),
+    ext_os::os::init_ops(),
+    ext_runtime::runtime_bootstrap::init_ops::<PermissionsContainer>(Some(
+      main_module_url,
+    )),
+    ext_runtime::runtime_net::init_ops(),
+    ext_runtime::runtime_http::init_ops(),
+    ext_runtime::runtime_http_start::init_ops(),
+    ext_runtime::runtime_node_compat::init_ops(),
+    // NOTE(AndresP): Order is matters. Otherwise, it will lead to hard
+    // errors such as SIGBUS depending on the platform.
+    ext_node::deno_node::init_ops::<PermissionsContainer>(node_services, fs),
+    deno::runtime::ops::permissions::deno_permissions::init_ops(),
+    ext_runtime::runtime::init_ops(),
+    ext_runtime::runtime_e2b::init_ops(),
+  ]
+}
+
+#[cfg(test)]
+pub(crate) fn e2b_extension_names() -> Vec<&'static str> {
+  e2b_runtime_extensions(
+    None,
+    get_root_cert_store_provider().expect("load root certificates"),
+    Default::default(),
+    Arc::new(deno_fs::RealFs),
+    ModuleSpecifier::parse("file:///e2b-test.ts").unwrap(),
+    None,
+  )
+  .into_iter()
+  .map(|extension| extension.name)
+  .collect()
+}
 
 #[ctor]
 fn init_v8_platform() {
@@ -440,7 +522,9 @@ where
 {
   #[allow(clippy::unnecessary_literal_unwrap)]
   #[allow(clippy::arc_with_non_send_sync)]
-  pub(crate) async fn new(mut worker: Worker) -> Result<Self, Error> {
+  pub(crate) async fn new(
+    mut worker: Worker,
+  ) -> Result<(Self, RuntimeInitTimings), Error> {
     let init_opts = worker.init_opts.take();
     let flags = worker.flags.clone();
     let event_metadata = worker.event_metadata.clone();
@@ -490,10 +574,13 @@ where
       s3_fs: Option<S3Fs>,
       beforeunload_cpu_threshold: ArcSwapOption<u64>,
       beforeunload_mem_threshold: ArcSwapOption<u64>,
+      runtime_init: RuntimeInitTimings,
+      bootstrap_start: Instant,
     }
 
     let bootstrap_fn = || {
       async {
+        let mut runtime_init = RuntimeInitTimings::default();
         // TODO(Nyannyacha): Make sure `service_path` is an absolute path first.
         let base_dir_path =
           std::env::current_dir().map(|p| p.join(&service_path))?;
@@ -503,6 +590,7 @@ where
           .and_then(|it| it.as_str())
           .map(str::to_string);
 
+        let loader_vfs_start = Instant::now();
         let eszip = if let Some(eszip_payload) = maybe_eszip {
           eszip_payload
         } else {
@@ -738,6 +826,8 @@ where
         } else {
           Arc::new(DenoCompileFileSystem::from_rc(vfs))
         })?;
+        runtime_init.loader_vfs_ms =
+          loader_vfs_start.elapsed().as_millis() as u64;
 
         // Outbound requests carry the project they were made from, so traffic
         // reported as abusive can be traced back to it.
@@ -755,7 +845,27 @@ where
             sanitized
           });
 
-        let extensions = vec![
+        let is_e2b_executor = maybe_user_conf.is_some_and(|it| {
+          it.runtime_profile == UserWorkerRuntimeProfile::E2bExecutor
+        });
+        let extensions = if is_e2b_executor {
+          let mut extensions = e2b_runtime_extensions(
+            project_ref,
+            root_cert_store_provider,
+            stdio,
+            fs,
+            main_module_url.clone(),
+            Some(node_services),
+          );
+          extensions.extend([
+            ops::permissions::base_runtime_permissions::init_ops_and_esm(
+              permissions,
+            ),
+            ops::bundle::base_runtime_bundle::init_ops(),
+          ]);
+          extensions
+        } else {
+          vec![
           deno_telemetry::deno_telemetry::init_ops(),
           deno_webidl::deno_webidl::init_ops(),
           deno_console::deno_console::init_ops(),
@@ -812,6 +922,7 @@ where
           ext_runtime::runtime_net::init_ops(),
           ext_runtime::runtime_http::init_ops(),
           ext_runtime::runtime_http_start::init_ops(),
+          ext_runtime::runtime_node_compat::init_ops(),
           // NOTE(AndresP): Order is matters. Otherwise, it will lead to hard
           // errors such as SIGBUS depending on the platform.
           ext_node::deno_node::init_ops::<PermissionsContainer>(
@@ -823,9 +934,12 @@ where
           ops::permissions::base_runtime_permissions::init_ops_and_esm(
             permissions,
           ),
+          ops::bundle::base_runtime_bundle::init_ops(),
           ext_runtime::runtime::init_ops(),
-        ];
+          ]
+        };
 
+        let resource_limits_start = Instant::now();
         let mut create_params = None;
         let mut mem_check = MemCheck::default();
 
@@ -894,7 +1008,17 @@ where
           }
         }
 
+        runtime_init.resource_limits_ms =
+          resource_limits_start.elapsed().as_millis() as u64;
+
         let mem_check = Arc::new(mem_check);
+        let startup_snapshot = if maybe_user_conf.is_some_and(|it| {
+          it.runtime_profile == UserWorkerRuntimeProfile::E2bExecutor
+        }) {
+          Some(snapshot::E2B_SNAPSHOT)
+        } else {
+          snapshot::snapshot()
+        };
         let runtime_options = RuntimeOptions {
           extensions,
           is_main: true,
@@ -903,7 +1027,7 @@ where
           get_error_class_fn: Some(&deno::errors::get_error_class_name),
           shared_array_buffer_store: None,
           compiled_wasm_module_store: None,
-          startup_snapshot: snapshot::snapshot(),
+          startup_snapshot,
           module_loader: Some(module_loader),
           import_meta_resolve_callback: Some(Box::new(
             import_meta_resolve_callback,
@@ -911,7 +1035,11 @@ where
           ..Default::default()
         };
 
+        let js_runtime_new_start = Instant::now();
         let mut js_runtime = JsRuntime::new(runtime_options);
+        runtime_init.js_runtime_new_ms =
+          js_runtime_new_start.elapsed().as_millis() as u64;
+        let bootstrap_start = Instant::now();
 
         let dispatch_fns = {
           let context = js_runtime.main_context();
@@ -956,11 +1084,39 @@ where
           let op_state = js_runtime.op_state();
           let mut op_state = op_state.borrow_mut();
 
+          let is_e2b_executor = maybe_user_conf.is_some_and(|it| {
+            it.runtime_profile == UserWorkerRuntimeProfile::E2bExecutor
+          });
+          let allow_node_vm = is_e2b_executor || conf
+            .context()
+            .and_then(|it| it.get("allowNodeVm"))
+            .and_then(|it| it.as_bool())
+            .unwrap_or(false);
+
+          let allow_transpile = is_e2b_executor || conf
+            .context()
+            .and_then(|it| it.get("allowTranspile"))
+            .and_then(|it| it.as_bool())
+            .unwrap_or(false);
+
           op_state.put(dispatch_fns);
           op_state.put(promise_metrics.clone());
           op_state.put(runtime_state.clone());
           op_state.put(GlobalMainContext(main_context));
-          op_state.put(RuntimeWaker(waker.clone()))
+          op_state.put(RuntimeWaker(waker.clone()));
+          op_state.put(ext_node::AllowNodeVm(allow_node_vm));
+          op_state.put(ext_runtime::AllowTranspile(allow_transpile));
+          op_state.put(ops::bundle::AllowBundle(
+            conf.to_worker_kind() == WorkerKind::MainWorker,
+          ));
+
+          // Only the main worker may bundle, so only it needs a confinement
+          // root; a user worker never reaches the op.
+          if conf.to_worker_kind() == WorkerKind::MainWorker {
+            if let Some(root) = ops::bundle::bundle_root() {
+              op_state.put(ops::bundle::BundleRoot(root));
+            }
+          }
         }
 
         {
@@ -1006,6 +1162,8 @@ where
           s3_fs,
           beforeunload_cpu_threshold,
           beforeunload_mem_threshold,
+          runtime_init,
+          bootstrap_start,
         })
       }
       .in_current_span()
@@ -1013,8 +1171,10 @@ where
 
     let span = Span::current();
     let handle = Handle::current();
+    let bootstrap_blocking_started = Instant::now();
     let bootstrap_ret = unsafe {
-      spawn_blocking_non_send(|| -> Result<Bootstrap, Error> {
+      spawn_blocking_non_send(|| -> Result<(Bootstrap, Duration), Error> {
+        let bootstrap_run_started = Instant::now();
         let mut bootstrap = handle.block_on(bootstrap_fn())?;
         let _span = span.entered();
 
@@ -1106,13 +1266,28 @@ where
             .transpose()
             .context("failed to execute bootstrap script")?;
         }
+        bootstrap.runtime_init.bootstrap_ms =
+          bootstrap.bootstrap_start.elapsed().as_millis() as u64;
 
         // from this moment on, using `v8::Locker` is enforced.
-        Ok(ScopeGuard::into_inner(bootstrap))
+        Ok((
+          ScopeGuard::into_inner(bootstrap),
+          bootstrap_run_started.elapsed(),
+        ))
       })
     }
     .await;
+    let bootstrap_blocking_total = bootstrap_blocking_started.elapsed();
 
+    let (bootstrap, bootstrap_blocking_run) = match bootstrap_ret {
+      Ok(Ok(result)) => result,
+      Ok(Err(err)) => {
+        return Err(err.context("failed to bootstrap runtime"));
+      }
+      Err(err) => {
+        return Err(err).context("failed to bootstrap runtime");
+      }
+    };
     let Bootstrap {
       waker,
       mut js_runtime,
@@ -1122,21 +1297,21 @@ where
       s3_fs,
       beforeunload_cpu_threshold,
       beforeunload_mem_threshold,
+      mut runtime_init,
       ..
-    } = match bootstrap_ret {
-      Ok(Ok(v)) => v,
-      Ok(Err(err)) => {
-        return Err(err.context("failed to bootstrap runtime"));
-      }
-      Err(err) => {
-        return Err(err).context("failed to bootstrap runtime");
-      }
-    };
+    } = bootstrap;
+    runtime_init.bootstrap_blocking_run_ms =
+      bootstrap_blocking_run.as_millis() as u64;
+    runtime_init.bootstrap_blocking_queue_ms = bootstrap_blocking_total
+      .saturating_sub(bootstrap_blocking_run)
+      .as_millis() as u64;
 
     let otel_attributes = event_metadata.otel_attributes.clone();
     let span = Span::current();
+    let post_setup_blocking_started = Instant::now();
     let post_task_ret = unsafe {
       spawn_blocking_non_send(|| {
+        let post_setup_run_started = Instant::now();
         let _span = span.entered();
 
         debug!("bootstrap post task");
@@ -1209,42 +1384,52 @@ where
             }
           }));
         }
+        post_setup_run_started.elapsed()
       })
     }
     .await;
+    let post_setup_blocking_total = post_setup_blocking_started.elapsed();
 
-    match post_task_ret {
-      Ok(_) => {}
+    let post_setup_blocking_run = match post_task_ret {
+      Ok(duration) => duration,
       Err(err) => {
         return Err(err).context("failed to bootstrap runtime");
       }
-    }
+    };
+    runtime_init.post_setup_blocking_run_ms =
+      post_setup_blocking_run.as_millis() as u64;
+    runtime_init.post_setup_blocking_queue_ms = post_setup_blocking_total
+      .saturating_sub(post_setup_blocking_run)
+      .as_millis() as u64;
 
-    Ok(Self {
-      runtime_state,
-      js_runtime: ManuallyDrop::new(js_runtime),
+    Ok((
+      Self {
+        runtime_state,
+        js_runtime: ManuallyDrop::new(js_runtime),
 
-      drop_token,
-      termination_request_token,
+        drop_token,
+        termination_request_token,
 
-      conf,
-      s3_fs,
+        conf,
+        s3_fs,
 
-      entrypoint,
-      main_module_url,
-      main_module_id: None,
+        entrypoint,
+        main_module_url,
+        main_module_id: None,
 
-      worker,
-      promise_metrics,
+        worker,
+        promise_metrics,
 
-      mem_check,
-      waker,
+        mem_check,
+        waker,
 
-      beforeunload_cpu_threshold: Arc::new(beforeunload_cpu_threshold),
-      beforeunload_mem_threshold: Arc::new(beforeunload_mem_threshold),
+        beforeunload_cpu_threshold: Arc::new(beforeunload_cpu_threshold),
+        beforeunload_mem_threshold: Arc::new(beforeunload_mem_threshold),
 
-      _phantom_runtime_context: PhantomData,
-    })
+        _phantom_runtime_context: PhantomData,
+      },
+      runtime_init,
+    ))
   }
 
   pub(crate) async fn init_main_module(&mut self) -> Result<(), Error> {
@@ -2360,10 +2545,42 @@ mod test {
 
   use crate::runtime::DenoRuntime;
   use crate::runtime::JsRuntimeLockerGuard;
+  use crate::snapshot;
   use crate::worker::WorkerBuilder;
 
   use super::GetRuntimeContext;
   use super::RunOptionsBuilder;
+
+  #[test]
+  fn test_e2b_snapshot_extension_order_matches_runtime_registration() {
+    assert_eq!(
+      snapshot::E2B_SNAPSHOT_EXTENSION_NAMES,
+      super::e2b_extension_names(),
+      "E2B snapshot and runtime extension registration must stay ordered"
+    );
+  }
+
+  #[test]
+  fn test_e2b_snapshot_registers_e2b_bootstrap() {
+    assert_eq!(
+      snapshot::E2B_SNAPSHOT_EXTENSION_NAMES.last(),
+      Some(&"runtime_e2b"),
+      "E2B snapshot must register the E2B bootstrap last"
+    );
+  }
+
+  #[test]
+  fn test_e2b_snapshot_registers_node_compat_before_deno_node() {
+    let deno_node_index = snapshot::E2B_SNAPSHOT_EXTENSION_NAMES
+      .iter()
+      .position(|name| *name == "deno_node")
+      .expect("E2B snapshot must register deno_node");
+
+    assert_eq!(
+      snapshot::E2B_SNAPSHOT_EXTENSION_NAMES[deno_node_index - 1],
+      "runtime_node_compat"
+    );
+  }
 
   impl<RuntimeContext> DenoRuntime<RuntimeContext> {
     fn to_value_mut<T>(
@@ -2476,6 +2693,7 @@ mod test {
       )
       .await
       .unwrap()
+      .0
     }
   }
 
@@ -2656,7 +2874,7 @@ mod test {
     )
     .await;
 
-    let mut rt = runtime.unwrap();
+    let mut rt = runtime.unwrap().0;
     let main_module_id = rt
       .init_main_module()
       .await
@@ -2745,7 +2963,7 @@ mod test {
     )
     .await;
 
-    let mut rt = runtime.unwrap();
+    let mut rt = runtime.unwrap().0;
     let main_module_id = rt
       .init_main_module()
       .await
@@ -2802,7 +3020,7 @@ mod test {
   #[tokio::test]
   #[serial]
   async fn test_user_runtime_creation() {
-    let allowed_apis = vec!["waitUntil"];
+    let allowed_apis = vec!["waitUntil", "transpile"];
 
     let mut runtime = RuntimeBuilder::new()
       .set_worker_runtime_conf(

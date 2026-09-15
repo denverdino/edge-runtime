@@ -106,6 +106,4893 @@ const NON_SECURE_PORT: u16 = 8498;
 const SECURE_PORT: u16 = 4433;
 const TESTBED_DEADLINE_SEC: u64 = 20;
 
+/// The adapter fails closed when `E2B_API_KEY` is unset, and the main worker
+/// inherits the test process's environment. Adapter fixtures run with
+/// `crates/base` as their working directory, so they also need an explicit
+/// executor path instead of the repository-root deployment default. This runs
+/// before any worker boots, which a per-test `set_var` could not guarantee.
+///
+/// `EDGE_RUNTIME_WORKER_POOL_SIZE` is set here for the same reason: the pool is
+/// a `Lazy`, and debug builds default to a single user-worker thread, so
+/// cross-sandbox concurrency tests would otherwise measure one shared thread.
+#[ctor::ctor]
+fn set_test_environment() {
+  if std::env::var("E2B_API_KEY").is_err() {
+    std::env::set_var("E2B_API_KEY", "test-key");
+  }
+  std::env::set_var("EXECUTOR_SERVICE_PATH", "../../examples/e2b-executor");
+  if std::env::var("EDGE_RUNTIME_WORKER_POOL_SIZE").is_err() {
+    std::env::set_var("EDGE_RUNTIME_WORKER_POOL_SIZE", "4");
+  }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_main_worker_bundles_a_service_once_and_reuses_it() {
+  integration_test!(
+    "./test_cases/e2b-bundle-probe-main",
+    NON_SECURE_PORT,
+    "",
+    None,
+    None,
+    None,
+    (|resp| async {
+      let body = resp.unwrap().text().await.unwrap();
+      let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+      assert_eq!(json["ok"], serde_json::json!(true), "got: {body}");
+      assert_eq!(
+        json["isUint8Array"],
+        serde_json::json!(true),
+        "bundle must hand JS raw bytes, got: {body}"
+      );
+      assert!(
+        json["byteLength"].as_u64().unwrap() > 0,
+        "an empty eszip cannot boot a worker, got: {body}"
+      );
+    }),
+    TerminationToken::new()
+  );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_prebuilt_eszip_boots_every_user_worker() {
+  integration_test!(
+    "./test_cases/e2b-bundle-probe-main",
+    NON_SECURE_PORT,
+    "?reuse=1",
+    None,
+    None,
+    None,
+    (|resp| async {
+      let body = resp.unwrap().text().await.unwrap();
+      let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+      assert_eq!(json["ok"], serde_json::json!(true), "got: {body}");
+
+      // Each worker is a fresh isolate, so both report their own first hit —
+      // one shared eszip must not mean one shared context.
+      for i in 0..2 {
+        let reply: serde_json::Value =
+          serde_json::from_str(json["bodies"][i].as_str().unwrap()).unwrap();
+
+        assert_eq!(reply["hits"], serde_json::json!(1), "got: {body}");
+        assert_eq!(
+          reply["canBundle"],
+          serde_json::json!(false),
+          "a user worker must not be able to bundle, got: {body}"
+        );
+      }
+    }),
+    TerminationToken::new()
+  );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_node_vm_allowed_by_context_flag_without_allow_run() {
+  integration_test!(
+    "./test_cases/e2b-vm-probe-main",
+    NON_SECURE_PORT,
+    "?vm=1",
+    None,
+    None,
+    None,
+    (|resp| async {
+      let body = resp.unwrap().text().await.unwrap();
+      assert!(
+        body.contains(r#""ok":true"#),
+        "node:vm should work with allowNodeVm, got: {body}"
+      );
+      assert!(body.contains(r#""result":2"#), "got: {body}");
+    }),
+    TerminationToken::new()
+  );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_node_vm_denied_without_context_flag() {
+  integration_test!(
+    "./test_cases/e2b-vm-probe-main",
+    NON_SECURE_PORT,
+    "?vm=0",
+    None,
+    None,
+    None,
+    (|resp| async {
+      let body = resp.unwrap().text().await.unwrap();
+      assert!(
+        body.contains(r#""ok":false"#),
+        "node:vm must stay gated without the flag, got: {body}"
+      );
+    }),
+    TerminationToken::new()
+  );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_user_worker_terminate_reaps_the_isolate() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-terminate-probe")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let mut terminate_response = tb
+    .request(|b| {
+      b.uri("/?timings=1")
+        .body(Body::empty())
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+  assert_eq!(terminate_response.status(), StatusCode::OK);
+  let body = to_bytes(terminate_response.body_mut()).await.unwrap();
+  let body = String::from_utf8(body.to_vec()).unwrap();
+  let terminate: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+  assert_eq!(
+    terminate["terminated"],
+    serde_json::json!(true),
+    "got: {body}"
+  );
+  assert_eq!(
+    terminate["trackedBefore"],
+    serde_json::json!(true),
+    "got: {body}"
+  );
+  assert_eq!(
+    terminate["trackedAfter"],
+    serde_json::json!(false),
+    "got: {body}"
+  );
+  assert!(
+    terminate["timing"]["fresh"]["runtimeInitMs"].is_number(),
+    "a fresh worker must report runtime initialization timing, got: {body}"
+  );
+  assert_eq!(
+    terminate["timing"]["reused"]["key"], terminate["timing"]["fresh"]["key"],
+    "the second create must reuse the fresh worker, got: {body}"
+  );
+  assert_eq!(
+    terminate["timing"]["reused"]["runtimeInitMs"],
+    serde_json::json!(0),
+    "a reused worker must not report a fresh runtime timing, got: {body}"
+  );
+  assert_eq!(
+    terminate["timing"]["reused"]["moduleInitMs"],
+    serde_json::json!(0),
+    "a reused worker must not report a fresh module timing, got: {body}"
+  );
+  for phase in [
+    "loaderVfsMs",
+    "resourceLimitsMs",
+    "jsRuntimeNewMs",
+    "bootstrapMs",
+    "bootstrapBlockingRunMs",
+    "bootstrapBlockingQueueMs",
+    "postSetupBlockingRunMs",
+    "postSetupBlockingQueueMs",
+  ] {
+    assert!(
+      terminate["timing"]["fresh"]["runtimeInit"][phase].is_number(),
+      "a fresh worker must report {phase}, got: {body}"
+    );
+    assert_eq!(
+      terminate["timing"]["reused"]["runtimeInit"][phase],
+      serde_json::json!(0),
+      "a reused worker must not report fresh {phase}, got: {body}"
+    );
+  }
+  assert_eq!(
+    terminate["terminatedAgain"],
+    serde_json::json!(false),
+    "got: {body}"
+  );
+
+  let mut shutdown_response = timeout(
+    Duration::from_secs(5),
+    tb.request(|b| {
+      b.uri("/shutdown")
+        .body(Body::empty())
+        .context("can't make request")
+    }),
+  )
+  .await
+  .expect("waitForShutdown endpoint timed out")
+  .unwrap();
+  assert_eq!(shutdown_response.status(), StatusCode::OK);
+  let body = to_bytes(shutdown_response.body_mut()).await.unwrap();
+  let body = String::from_utf8(body.to_vec()).unwrap();
+  let shutdown: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+  assert_eq!(
+    shutdown["shutdown"]["reason"],
+    serde_json::json!("TerminationRequested"),
+    "got: {body}"
+  );
+  assert!(
+    shutdown["shutdown"]["cpuTimeUsed"].is_number(),
+    "got: {body}"
+  );
+  assert!(
+    shutdown["shutdown"]["memoryUsed"]["total"]
+      .as_u64()
+      .unwrap_or_default()
+      > 0
+      && shutdown["shutdown"]["memoryUsed"]["heap"]
+        .as_u64()
+        .unwrap_or_default()
+        > 0,
+    "the final shutdown must include V8 heap telemetry, got: {body}"
+  );
+  assert!(
+    shutdown["shutdown"]["memoryUsed"]["external"].is_number(),
+    "got: {body}"
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+/// Asserts that `UserWorker.terminate()` reaps the target isolate rather than
+/// merely deregistering it. The `policy_fn` selects which supervisor policy
+/// hosts the target worker; every policy must reap it.
+async fn assert_user_worker_terminate_shuts_down_the_isolate(
+  policy_fn: fn(TestBedBuilder) -> TestBedBuilder,
+) {
+  let (tx, mut rx) = mpsc::unbounded_channel();
+  let tb = policy_fn(TestBedBuilder::new("./test_cases/e2b-terminate-probe"))
+    .with_worker_event_sender(Some(tx))
+    .build()
+    .await;
+
+  let mut resp = tb
+    .request(|b| b.uri("/").body(Body::empty()).context("can't make request"))
+    .await
+    .unwrap();
+
+  assert_eq!(resp.status().as_u16(), StatusCode::OK);
+
+  let body = to_bytes(resp.body_mut()).await.unwrap();
+  let body = String::from_utf8(body.to_vec()).unwrap();
+  let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+  // `TerminationRequested` is also reachable from the driver's drop guard, so
+  // pin the reason below to an actual `terminate()` call by the probe.
+  assert_eq!(json["terminated"], serde_json::json!(true), "got: {body}");
+
+  let mut shutdown = None;
+  while let Ok(Some(ev)) =
+    tokio::time::timeout(Duration::from_secs(10), rx.recv()).await
+  {
+    let is_target = ev.metadata.service_path.as_deref()
+      == Some("./test_cases/e2b-terminate-target");
+
+    if let WorkerEvents::Shutdown(ev) = ev.event {
+      if is_target {
+        shutdown = Some(ev);
+        break;
+      }
+    }
+  }
+
+  rx.close();
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+
+  let shutdown =
+    shutdown.expect("the target isolate must report a shutdown event");
+
+  assert_eq!(
+    shutdown.reason,
+    ShutdownReason::TerminationRequested,
+    "got: {shutdown:?}"
+  );
+
+  // NOTE: The reason alone does not prove the isolate died - a supervisor that
+  // returns without dispatching the V8 termination interrupt reports the same
+  // reason. Only `v8_handle_termination`, which runs inside the live isolate
+  // and calls `terminate_execution`, reads the final heap statistics; when no
+  // interrupt is dispatched its sender is dropped and these are all zero.
+  assert!(
+    shutdown.memory_used.total > 0 && shutdown.memory_used.heap > 0,
+    "the V8 termination interrupt must have run in the target isolate, got: {:?}",
+    shutdown.memory_used
+  );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_user_worker_terminate_shuts_down_the_isolate() {
+  assert_user_worker_terminate_shuts_down_the_isolate(|it| {
+    it.with_per_worker_policy(None)
+  })
+  .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_user_worker_terminate_shuts_down_the_isolate_per_request() {
+  // The per-request strategy has its own `supervise.cancelled()` arm, so it
+  // needs its own coverage. `oneshot` cannot host this probe because
+  // `forceCreate` is silently ignored under it (`WorkerPool::create_user_worker`),
+  // so the target could be an unrelated reused worker.
+  assert_user_worker_terminate_shuts_down_the_isolate(|it| {
+    it.with_per_request_policy(None)
+  })
+  .await;
+}
+
+const WORKER_OP_PROBE_CHILD_ENV: &str = "E2B_WORKER_OP_PROBE_CHILD";
+const WORKER_OP_PROBE_OK: &str = "WORKER_OP_PROBE_OK";
+
+/// A privileged worker-management op called from a user worker must fail closed
+/// with a thrown capability error, not abort the process. The message sender it
+/// needs is installed only in the main worker, and the mandatory `borrow()` for
+/// an absent type is a non-unwinding panic that aborts the whole runtime.
+///
+/// The probe runs in a re-exec'd child so the pre-fix abort surfaces here as a
+/// non-zero child exit (a failed assertion) instead of killing this harness.
+#[tokio::test]
+#[serial]
+async fn test_user_worker_management_op_fails_closed_without_abort() {
+  let exe = std::env::current_exe().expect("test executable path");
+  let output = std::process::Command::new(exe)
+    .args([
+      "--ignored",
+      "--nocapture",
+      "--test-threads=1",
+      "worker_management_op_probe_child",
+    ])
+    .env(WORKER_OP_PROBE_CHILD_ENV, "1")
+    .output()
+    .expect("failed to run the probe child");
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    output.status.success(),
+    "worker-management op aborted the child instead of failing closed: \
+     status={:?}\nstdout=\n{stdout}\nstderr=\n{stderr}",
+    output.status
+  );
+  assert!(
+    stdout.contains(WORKER_OP_PROBE_OK),
+    "child did not confirm a clean capability error:\nstdout=\n{stdout}\n\
+     stderr=\n{stderr}"
+  );
+}
+
+/// Child half of `test_user_worker_management_op_fails_closed_without_abort`.
+/// Ignored so it only runs when the parent re-execs it with the guard env set.
+/// It drives the probe twice to prove the server keeps answering after the op
+/// fails closed.
+#[tokio::test]
+#[ignore]
+async fn worker_management_op_probe_child() {
+  if std::env::var(WORKER_OP_PROBE_CHILD_ENV).is_err() {
+    return;
+  }
+
+  let tb = TestBedBuilder::new("./test_cases/e2b-worker-op-probe-main")
+    .build()
+    .await;
+
+  for _ in 0..2 {
+    let mut resp = tb
+      .request(|b| b.uri("/").body(Body::empty()).context("can't make request"))
+      .await
+      .unwrap();
+
+    assert_eq!(resp.status().as_u16(), StatusCode::OK);
+
+    let body = to_bytes(resp.body_mut()).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(json["threw"], serde_json::json!(true), "got: {body}");
+    assert!(
+      json["error"]
+        .as_str()
+        .unwrap()
+        .contains("only available to the main worker"),
+      "got: {body}"
+    );
+  }
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+
+  println!("{WORKER_OP_PROBE_OK}");
+}
+
+/// A vm-enabled isolate must never be reused to satisfy a create that did not
+/// request vm access. The pool reuse key folds in `allowNodeVm`, so the second
+/// (non-vm) create for the same service path gets a fresh isolate that denies
+/// node:vm.
+#[tokio::test]
+#[serial]
+async fn test_vm_worker_is_not_reused_for_non_vm_create() {
+  integration_test!(
+    "./test_cases/e2b-vm-reuse-probe-main",
+    NON_SECURE_PORT,
+    "",
+    None,
+    None,
+    None,
+    (
+      |(port, _url, _req_builder, _event_rx, _metric_src)| async move {
+        let base = format!("http://localhost:{port}");
+
+        // First a vm-enabled create, then a non-vm create for the same service
+        // path (neither forces creation), so the second can only differ if the
+        // reuse key folds in the vm capability.
+        let vm: serde_json::Value = reqwest::get(format!("{base}/?vm=1"))
+          .await
+          .unwrap()
+          .json()
+          .await
+          .unwrap();
+        let plain: serde_json::Value = reqwest::get(format!("{base}/?vm=0"))
+          .await
+          .unwrap()
+          .json()
+          .await
+          .unwrap();
+
+        assert_eq!(
+          vm["vm"]["ok"],
+          serde_json::json!(true),
+          "the vm create should get node:vm, got: {vm}"
+        );
+        assert_eq!(
+          plain["vm"]["ok"],
+          serde_json::json!(false),
+          "the non-vm create must not get node:vm, got: {plain}"
+        );
+        assert_ne!(
+          vm["key"], plain["key"],
+          "a non-vm create must not reuse the vm isolate: vm={vm} plain={plain}"
+        );
+
+        Some(Ok(reqwest::get(format!("{base}/?vm=0")).await.unwrap()))
+      },
+      |_resp| async {}
+    ),
+    TerminationToken::new()
+  );
+}
+
+/// A transpile-enabled isolate must never be reused for a standard create of
+/// the same service path.
+#[tokio::test]
+#[serial]
+async fn test_transpile_worker_is_not_reused_for_non_transpile_create() {
+  integration_test!(
+    "./test_cases/e2b-transpile-reuse-probe-main",
+    NON_SECURE_PORT,
+    "",
+    None,
+    None,
+    None,
+    (
+      |(port, _url, _req_builder, _event_rx, _metric_src)| async move {
+        let base = format!("http://localhost:{port}");
+        let transpile_response =
+          reqwest::get(format!("{base}/?transpile=1")).await.unwrap();
+        let transpile_status = transpile_response.status();
+        let transpile: serde_json::Value =
+          transpile_response.json().await.unwrap();
+        let plain_response =
+          reqwest::get(format!("{base}/?transpile=0")).await.unwrap();
+        let plain_status = plain_response.status();
+        let plain: serde_json::Value = plain_response.json().await.unwrap();
+
+        assert!(
+          transpile_status.is_success(),
+          "the transpile create should succeed, got: {transpile}"
+        );
+        assert_eq!(
+          transpile["status"],
+          serde_json::json!(200),
+          "the transpile worker should respond successfully, got: {transpile}"
+        );
+        assert_ne!(
+          transpile["key"], plain["key"],
+          "a non-transpile create must not reuse the transpile isolate: \
+           transpile={transpile} plain_status={plain_status} plain={plain}"
+        );
+        assert!(
+          !plain_status.is_success(),
+          "the non-transpile worker must preserve its denied response: {plain}"
+        );
+        assert!(
+          !plain["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("\"stripped\"")),
+          "the non-transpile worker must not return a transpile result: {plain}"
+        );
+
+        Some(Ok(
+          reqwest::get(format!("{base}/?transpile=0")).await.unwrap(),
+        ))
+      },
+      |_resp| async {}
+    ),
+    TerminationToken::new()
+  );
+}
+
+/// An E2B executor profile enables node:vm without the legacy context flag,
+/// while a standard profile for the same service must not reuse that isolate.
+#[tokio::test]
+#[serial]
+async fn test_e2b_runtime_profile_is_not_reused_for_standard_create() {
+  integration_test!(
+    "./test_cases/e2b-vm-reuse-probe-main",
+    NON_SECURE_PORT,
+    "",
+    None,
+    None,
+    None,
+    (
+      |(port, _url, _req_builder, _event_rx, _metric_src)| async move {
+        let base = format!("http://localhost:{port}");
+
+        let e2b: serde_json::Value =
+          reqwest::get(format!("{base}/?profile=e2b"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let standard: serde_json::Value =
+          reqwest::get(format!("{base}/?profile=standard"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(
+          e2b["vm"]["ok"],
+          serde_json::json!(true),
+          "the E2B profile should get node:vm, got: {e2b}"
+        );
+        assert_eq!(
+          standard["vm"]["ok"],
+          serde_json::json!(false),
+          "the standard profile must not get node:vm, got: {standard}"
+        );
+        assert_ne!(
+          e2b["key"], standard["key"],
+          "standard profile must not reuse E2B isolate: \
+           e2b={e2b}, standard={standard}"
+        );
+
+        Some(Ok(
+          reqwest::get(format!("{base}/?profile=standard"))
+            .await
+            .unwrap(),
+        ))
+      },
+      |_resp| async {}
+    ),
+    TerminationToken::new()
+  );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_runtime_profile_hardens_bootstrap_without_standard_runtime() {
+  integration_test!(
+    "./test_cases/e2b-bootstrap-hardening-main",
+    NON_SECURE_PORT,
+    "",
+    None,
+    None,
+    None,
+    (|resp| async {
+      let body = resp.unwrap().text().await.unwrap();
+      let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+      assert_eq!(json["vm"]["result"], serde_json::json!(2), "got: {body}");
+      assert_eq!(
+        json["realPath"]["name"],
+        serde_json::json!("PermissionDenied"),
+        "got: {body}"
+      );
+
+      for name in ["kill", "exit", "addSignalListener", "removeSignalListener"]
+      {
+        assert_eq!(
+          json["mocks"][name]["name"],
+          serde_json::json!("TypeError"),
+          "{name} did not throw TypeError: {body}"
+        );
+        assert_eq!(
+          json["mocks"][name]["message"],
+          serde_json::json!("called MOCK_FN"),
+          "{name} had the wrong error message: {body}"
+        );
+      }
+
+      assert_eq!(
+        json["sharedMemory"]["name"],
+        serde_json::json!("TypeError"),
+        "got: {body}"
+      );
+      assert_eq!(
+        json["sharedMemory"]["message"],
+        serde_json::json!("Creating a shared memory is not supported"),
+        "got: {body}"
+      );
+      assert_eq!(
+        json["execPath"],
+        serde_json::json!("/bin/edge-runtime"),
+        "got: {body}"
+      );
+      assert!(
+        json["memoryUsage"]["rss"].is_number(),
+        "memoryUsage.rss was not numeric: {body}"
+      );
+    }),
+    TerminationToken::new()
+  );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_edge_runtime_transpile_strips_types_and_errors_safely() {
+  integration_test!(
+    "./test_cases/e2b-transpile-probe-main",
+    NON_SECURE_PORT,
+    "",
+    None,
+    None,
+    None,
+    (|resp| async {
+      let body = resp.unwrap().text().await.unwrap();
+      let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+      let stripped = json["stripped"].as_str().unwrap();
+      assert!(stripped.contains("let x = 1"), "got: {stripped}");
+      assert!(!stripped.contains(": number"), "got: {stripped}");
+
+      for input in ["malformed", "truncated"] {
+        assert!(
+          json[input].as_str().unwrap().starts_with("threw:"),
+          "{input} input did not throw: {body}"
+        );
+      }
+
+      let survived = json["survived"].as_str().unwrap();
+      assert!(survived.contains("const alive = true"), "got: {survived}");
+      assert!(!survived.contains(": boolean"), "got: {survived}");
+    }),
+    TerminationToken::new()
+  );
+}
+
+/// A user worker that did not opt into transpile must be denied by the op
+/// itself, not merely by the namespace. The parser runs arbitrary source on a
+/// 512 MiB stack, so it is a capability reserved for the trusted E2B executor.
+#[tokio::test]
+#[serial]
+async fn test_transpile_denied_without_allow_transpile() {
+  integration_test!(
+    "./test_cases/e2b-transpile-denied-probe-main",
+    NON_SECURE_PORT,
+    "",
+    None,
+    None,
+    None,
+    (|resp| async {
+      let body = resp.unwrap().text().await.unwrap();
+      let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+      assert_eq!(json["threw"], serde_json::json!(true), "got: {body}");
+      assert!(
+        json["error"]
+          .as_str()
+          .unwrap()
+          .contains("transpile is not enabled for this worker"),
+        "got: {body}"
+      );
+    }),
+    TerminationToken::new()
+  );
+}
+
+/// Bundling reads and resolves whatever path it is handed, so it must be
+/// confined to the bundle root. The shipped executor lives under the root and
+/// must still bundle; an absolute path outside it must be refused.
+#[tokio::test]
+#[serial]
+async fn test_bundle_confined_to_root() {
+  integration_test!(
+    "./test_cases/e2b-bundle-confine-probe-main",
+    NON_SECURE_PORT,
+    "",
+    None,
+    None,
+    None,
+    (|resp| async {
+      let body = resp.unwrap().text().await.unwrap();
+      let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+      assert_eq!(
+        json["executor"]["ok"],
+        serde_json::json!(true),
+        "the shipped executor is under the bundle root, got: {body}"
+      );
+      assert!(
+        json["executor"]["byteLength"].as_u64().unwrap() > 0,
+        "an empty eszip cannot boot a worker, got: {body}"
+      );
+
+      assert_eq!(
+        json["outside"]["ok"],
+        serde_json::json!(false),
+        "a path outside the bundle root must be refused, got: {body}"
+      );
+      assert!(
+        json["outside"]["error"]
+          .as_str()
+          .unwrap()
+          .contains("outside the bundle root"),
+        "got: {body}"
+      );
+    }),
+    TerminationToken::new()
+  );
+}
+
+async fn e2b_execute(
+  tb: &TestBed,
+  sandbox: &str,
+  code: &str,
+) -> serde_json::Value {
+  e2b_execute_with_env(tb, sandbox, code, serde_json::json!({})).await
+}
+
+async fn e2b_execute_ts(
+  tb: &TestBed,
+  sandbox: &str,
+  code: &str,
+) -> serde_json::Value {
+  let body = serde_json::json!({ "code": code, "language": "typescript" });
+  let mut resp = tb
+    .request(|b| {
+      b.uri("/internal/execute")
+        .method("POST")
+        .header("x-sandbox-id", sandbox)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+
+  assert_eq!(resp.status().as_u16(), StatusCode::OK);
+
+  let bytes = to_bytes(resp.body_mut()).await.unwrap();
+  serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn e2b_execute_with_env(
+  tb: &TestBed,
+  sandbox: &str,
+  code: &str,
+  env_vars: serde_json::Value,
+) -> serde_json::Value {
+  let body = serde_json::json!({
+    "code": code,
+    "language": "javascript",
+    "env_vars": env_vars,
+  });
+  let mut resp = tb
+    .request(|b| {
+      b.uri("/internal/execute")
+        .method("POST")
+        .header("x-sandbox-id", sandbox)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+
+  assert_eq!(resp.status().as_u16(), StatusCode::OK);
+
+  let bytes = to_bytes(resp.body_mut()).await.unwrap();
+  serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn e2b_execute_with_baseline_env(
+  tb: &TestBed,
+  sandbox: &str,
+  code: &str,
+  sandbox_env: &str,
+) -> serde_json::Value {
+  let body = serde_json::json!({ "code": code, "language": "javascript" });
+  let mut resp = tb
+    .request(|b| {
+      b.uri("/internal/execute")
+        .method("POST")
+        .header("x-sandbox-id", sandbox)
+        .header("x-sandbox-env", sandbox_env)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+
+  assert_eq!(resp.status().as_u16(), StatusCode::OK);
+
+  let bytes = to_bytes(resp.body_mut()).await.unwrap();
+  serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_persists_primitive_state() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let first = e2b_execute(&tb, "s1", "let x = 1").await;
+  assert_eq!(first["error"], serde_json::Value::Null);
+
+  e2b_execute(&tb, "s1", "x++").await;
+
+  let third = e2b_execute(&tb, "s1", "x").await;
+  assert_eq!(third["result"], serde_json::json!(2));
+  assert_eq!(third["result_type"], serde_json::json!("number"));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_typescript_state_persists() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let first = e2b_execute_ts(&tb, "ts1", "let x: number = 10").await;
+  assert_eq!(first["error"], serde_json::Value::Null);
+  e2b_execute_ts(&tb, "ts1", "x += 5").await;
+  let third = e2b_execute_ts(&tb, "ts1", "x").await;
+  assert_eq!(third["result"], serde_json::json!(15));
+
+  let typed = e2b_execute_ts(
+    &tb,
+    "ts1",
+    "interface User { name: string }\nconst user: User = { name: 'alice' }",
+  )
+  .await;
+  assert_eq!(typed["error"], serde_json::Value::Null);
+  let name = e2b_execute_ts(&tb, "ts1", "user.name").await;
+  assert_eq!(name["result"], serde_json::json!("alice"));
+  let erased = e2b_execute(&tb, "ts1", "typeof User").await;
+  assert_eq!(erased["result"], serde_json::json!("undefined"));
+
+  let shared_with_js = e2b_execute(&tb, "ts1", "x").await;
+  assert_eq!(shared_with_js["result"], serde_json::json!(15));
+  e2b_execute(&tb, "ts1", "let fromJavaScript = 4").await;
+  let shared_with_ts =
+    e2b_execute_ts(&tb, "ts1", "(fromJavaScript as number) + 1").await;
+  assert_eq!(shared_with_ts["result"], serde_json::json!(5));
+
+  let promise = e2b_execute_ts(
+    &tb,
+    "ts1",
+    "Promise.resolve(21).then((value: number) => value * 2)",
+  )
+  .await;
+  assert_eq!(promise["result"], serde_json::json!(42));
+
+  let malformed = e2b_execute_ts(&tb, "ts1", "let broken: = ;;;").await;
+  assert_eq!(
+    malformed["error"]["kind"],
+    serde_json::json!("compile_error")
+  );
+  let survived = e2b_execute_ts(&tb, "ts1", "x").await;
+  assert_eq!(survived["result"], serde_json::json!(15));
+
+  for source in [
+    "export const unsupported = true",
+    "import { unsupported } from './unsupported.ts'; unsupported",
+    "await Promise.resolve('unsupported')",
+  ] {
+    let module_syntax = e2b_execute_ts(&tb, "ts1", source).await;
+    assert_eq!(
+      module_syntax["error"]["kind"],
+      serde_json::json!("compile_error"),
+      "source: {source}, response: {module_syntax}",
+    );
+  }
+
+  let runtime_syntax =
+    e2b_execute_ts(&tb, "ts1", "throw new SyntaxError('runtime syntax')").await;
+  assert_eq!(
+    runtime_syntax["error"]["kind"],
+    serde_json::json!("runtime_error")
+  );
+
+  let body = serde_json::json!({
+    "code": "globalThis.unsupportedLanguageRan = true",
+    "language": "python",
+  });
+  let mut resp = tb
+    .request(|b| {
+      b.uri("/internal/execute")
+        .method("POST")
+        .header("x-sandbox-id", "ts1")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+  assert_eq!(resp.status().as_u16(), StatusCode::OK);
+  let bytes = to_bytes(resp.body_mut()).await.unwrap();
+  let rejected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+  assert_eq!(
+    rejected["error"]["kind"],
+    serde_json::json!("unsupported_language")
+  );
+  assert_eq!(rejected["error"]["message"], serde_json::json!("python"));
+  assert_eq!(rejected["stdout"], serde_json::json!([]));
+  assert_eq!(rejected["stderr"], serde_json::json!([]));
+  let did_not_run =
+    e2b_execute(&tb, "ts1", "typeof unsupportedLanguageRan").await;
+  assert_eq!(did_not_run["result"], serde_json::json!("undefined"));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_isolates_sandboxes() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  e2b_execute(&tb, "a", "let secret = 'A'").await;
+  let probe = e2b_execute(&tb, "b", "typeof secret").await;
+  assert_eq!(probe["result"], serde_json::json!("undefined"));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_isolates_state_and_secrets() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  e2b_execute(&tb, "boundary", "let boundaryState = 1").await;
+
+  for source in [
+    "typeof Deno",
+    "typeof Deno?.core",
+    "typeof EdgeRuntime",
+    r#"TextEncoder.constructor("return typeof Deno.core")()"#,
+    r#"globalThis.constructor.constructor("return typeof Deno.core")()"#,
+    r#"
+      ({ then(resolve) {
+        globalThis.leaked = resolve.constructor.constructor(
+          "return typeof Deno.core",
+        )();
+        resolve(1);
+      } })
+    "#,
+  ] {
+    let probe = e2b_execute(&tb, "boundary", source).await;
+    assert!(
+      probe["result"] == serde_json::json!("undefined")
+        || probe["error"]["kind"] == serde_json::json!("runtime_error"),
+      "sandbox escape succeeded for {source}: {probe}",
+    );
+
+    let alive = e2b_execute(&tb, "boundary", "boundaryState += 1").await;
+    assert_eq!(alive["error"], serde_json::Value::Null);
+  }
+
+  let leaked = e2b_execute(&tb, "boundary", "globalThis.leaked").await;
+  assert_eq!(leaked["result_type"], serde_json::json!("undefined"));
+  assert_eq!(
+    e2b_execute(&tb, "boundary", "boundaryState").await["result"],
+    serde_json::json!(7)
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_text_codec_round_trips() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  // The in-realm TextEncoder/TextDecoder must round-trip BMP and astral code
+  // points, resume a decode split mid-multibyte across `{ stream: true }`
+  // calls, match the platform for `encode(undefined)` (empty output), strip a
+  // leading BOM by default, and throw on invalid bytes when `fatal` is set.
+  let probe = e2b_execute(
+    &tb,
+    "codec",
+    r#"
+      const enc = new TextEncoder();
+      const round =
+        new TextDecoder().decode(enc.encode("héllo 𐍈")) === "héllo 𐍈";
+      const astral = enc.encode("𐍈");
+      const dec = new TextDecoder();
+      const first = dec.decode(astral.subarray(0, 2), { stream: true });
+      const second = dec.decode(astral.subarray(2), { stream: true });
+      const streamed = first === "" && first + second === "𐍈";
+      const undefinedLen = enc.encode(undefined).length;
+      const bom = new TextDecoder().decode(
+        new Uint8Array([0xEF, 0xBB, 0xBF, 0x41]),
+      );
+      let fatalThrows = false;
+      try {
+        new TextDecoder("utf-8", { fatal: true })
+          .decode(new Uint8Array([0xFF]));
+      } catch (error) {
+        fatalThrows = error instanceof TypeError;
+      }
+      [round, streamed, undefinedLen, bom, fatalThrows]
+    "#,
+  )
+  .await;
+  assert_eq!(probe["error"], serde_json::Value::Null);
+  assert_eq!(
+    probe["result"],
+    serde_json::json!([true, true, 0, "A", true])
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_env_override_is_request_scoped() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let mut resp = tb
+    .request(|b| {
+      b.uri("/internal/execute")
+        .method("POST")
+        .header("x-sandbox-id", "envbox")
+        .header("x-sandbox-env", r#"{"FOO":"sandbox"}"#)
+        .header("content-type", "application/json")
+        .body(Body::from(
+          r#"{"code":"process.env.FOO","language":"javascript"}"#,
+        ))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+  assert_eq!(resp.status().as_u16(), StatusCode::OK);
+  let bytes = to_bytes(resp.body_mut()).await.unwrap();
+  let first: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+  assert_eq!(first["result"], serde_json::json!("sandbox"));
+
+  let mut resp = tb
+    .request(|b| {
+      b.uri("/internal/execute")
+        .method("POST")
+        .header("x-sandbox-id", "envbox")
+        .header("content-type", "application/json")
+        .body(Body::from(
+          r#"{"code":"process.env.FOO","language":"javascript","env_vars":{"FOO":"request"}}"#,
+        ))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+  assert_eq!(resp.status().as_u16(), StatusCode::OK);
+  let bytes = to_bytes(resp.body_mut()).await.unwrap();
+  let second: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+  assert_eq!(second["result"], serde_json::json!("request"));
+
+  let reverted = e2b_execute(&tb, "envbox", "process.env.FOO").await;
+  assert_eq!(reverted["result"], serde_json::json!("sandbox"));
+
+  let process_surface = e2b_execute(
+    &tb,
+    "envbox",
+    "[Object.keys(process), typeof process.cwd, typeof process.env.constructor, Object.getPrototypeOf(process) === null]",
+  )
+  .await;
+  assert_eq!(
+    process_surface["result"],
+    serde_json::json!([["env"], "undefined", "undefined", true])
+  );
+
+  let secret = e2b_execute(&tb, "envbox", "process.env.E2B_API_KEY").await;
+  assert_eq!(secret["result_type"], serde_json::json!("undefined"));
+
+  let sabotage = e2b_execute(
+    &tb,
+    "envbox",
+    r#"
+      process.env.FOO = 'mutated';
+      const observed = process.env.FOO;
+      let processRedefinition = 'allowed';
+      let envRedefinition = 'allowed';
+      try {
+        Object.defineProperty(globalThis, 'process', {
+          value: { env: { FOO: 'poisoned' } },
+        });
+      } catch {
+        processRedefinition = 'blocked';
+      }
+      try {
+        Object.defineProperty(process, 'env', {
+          value: { FOO: 'poisoned' },
+        });
+      } catch {
+        envRedefinition = 'blocked';
+      }
+      Object.freeze(process.env);
+      Object.freeze(process);
+      [
+        observed,
+        processRedefinition,
+        envRedefinition,
+        Object.isFrozen(process),
+        Object.isFrozen(process.env),
+      ]
+    "#,
+  )
+  .await;
+  assert_eq!(
+    sabotage["result"],
+    serde_json::json!(["mutated", "blocked", "blocked", true, true])
+  );
+
+  let after = e2b_execute(&tb, "envbox", "process.env.FOO").await;
+  assert_eq!(after["result"], serde_json::json!("sandbox"));
+
+  let mut malformed_later = tb
+    .request(|b| {
+      b.uri("/internal/execute")
+        .method("POST")
+        .header("x-sandbox-id", "envbox")
+        .header("x-sandbox-env", "{not-json")
+        .header("content-type", "application/json")
+        .body(Body::from(
+          r#"{"code":"process.env.FOO","language":"javascript"}"#,
+        ))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+  assert_eq!(malformed_later.status().as_u16(), StatusCode::OK);
+  let bytes = to_bytes(malformed_later.body_mut()).await.unwrap();
+  let malformed_later: serde_json::Value =
+    serde_json::from_slice(&bytes).unwrap();
+  assert_eq!(malformed_later["result"], serde_json::json!("sandbox"));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_rejects_non_string_env_values() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  for invalid_env in [
+    serde_json::json!({ "INVALID": { "nested": "value" } }),
+    serde_json::json!({ "INVALID": ["value"] }),
+    serde_json::json!({ "INVALID": 1 }),
+    serde_json::json!({ "INVALID": null }),
+    serde_json::json!(["value"]),
+    serde_json::json!(1),
+    serde_json::Value::Null,
+  ] {
+    let body = serde_json::json!({
+      "code": "globalThis.invalidEnvCodeRan = true",
+      "language": "javascript",
+      "env_vars": invalid_env,
+    });
+    let mut resp = tb
+      .request(|b| {
+        b.uri("/internal/execute")
+          .method("POST")
+          .header("x-sandbox-id", "invalid-request-env")
+          .header("content-type", "application/json")
+          .body(Body::from(body.to_string()))
+          .context("can't make request")
+      })
+      .await
+      .unwrap();
+    assert_eq!(resp.status().as_u16(), StatusCode::BAD_REQUEST);
+
+    let bytes = to_bytes(resp.body_mut()).await.unwrap();
+    let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+      error,
+      serde_json::json!({
+        "result": null,
+        "result_type": "undefined",
+        "stdout": [],
+        "stderr": [],
+        "error": {
+          "kind": "internal_error",
+          "name": "TypeError",
+          "message": "environment variables must be an object with string values",
+        },
+      })
+    );
+  }
+
+  let probe = e2b_execute(
+    &tb,
+    "invalid-request-env",
+    "typeof globalThis.invalidEnvCodeRan",
+  )
+  .await;
+  assert_eq!(probe["result"], serde_json::json!("undefined"));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_treats_dangerous_env_keys_as_strings() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let mut resp = tb
+    .request(|b| {
+      b.uri("/internal/execute")
+        .method("POST")
+        .header("x-sandbox-id", "dangerous-env-keys")
+        .header(
+          "x-sandbox-env",
+          r#"{"constructor":"sandbox","__proto__":"sandbox-proto"}"#,
+        )
+        .header("content-type", "application/json")
+        .body(Body::from(
+          r#"{
+            "code":"[process.env.constructor,process.env.__proto__,typeof process.env.constructor,typeof process.env.__proto__,Object.getPrototypeOf(process.env)===null,({}).polluted===undefined]",
+            "language":"javascript",
+            "env_vars":{"constructor":"request","__proto__":"request-proto"}
+          }"#,
+        ))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+  assert_eq!(resp.status().as_u16(), StatusCode::OK);
+
+  let bytes = to_bytes(resp.body_mut()).await.unwrap();
+  let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+  assert_eq!(
+    result["result"],
+    serde_json::json!([
+      "request",
+      "request-proto",
+      "string",
+      "string",
+      true,
+      true,
+    ])
+  );
+
+  let baseline = e2b_execute(
+    &tb,
+    "dangerous-env-keys",
+    "[process.env.constructor, process.env.__proto__]",
+  )
+  .await;
+  assert_eq!(
+    baseline["result"],
+    serde_json::json!(["sandbox", "sandbox-proto"])
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_retries_after_invalid_baseline_env() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let mut failed = tb
+    .request(|b| {
+      b.uri("/internal/execute")
+        .method("POST")
+        .header("x-sandbox-id", "init-retry")
+        .header("x-sandbox-env", "{not-json")
+        .header("content-type", "application/json")
+        .body(Body::from(
+          r#"{"code":"globalThis.invalidInitCodeRan=true","language":"javascript"}"#,
+        ))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+  assert_eq!(failed.status().as_u16(), StatusCode::BAD_REQUEST);
+  let _ = to_bytes(failed.body_mut()).await.unwrap();
+
+  let mut retried = tb
+    .request(|b| {
+      b.uri("/internal/execute")
+        .method("POST")
+        .header("x-sandbox-id", "init-retry")
+        .header("x-sandbox-env", r#"{"FOO":"valid"}"#)
+        .header("content-type", "application/json")
+        .body(Body::from(
+          r#"{"code":"[process.env.FOO,typeof globalThis.invalidInitCodeRan]","language":"javascript"}"#,
+        ))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+  assert_eq!(retried.status().as_u16(), StatusCode::OK);
+  let bytes = to_bytes(retried.body_mut()).await.unwrap();
+  let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+  assert_eq!(result["result"], serde_json::json!(["valid", "undefined"]));
+
+  let mut count = tb
+    .request(|b| {
+      b.uri("/internal/harness/worker-creation-count")
+        .header("x-sandbox-id", "init-retry")
+        .body(Body::empty())
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+  let bytes = to_bytes(count.body_mut()).await.unwrap();
+  let count: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+  assert_eq!(count["count"], serde_json::json!(1));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_captures_output_and_serializes_exotics() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let logged = e2b_execute(
+    &tb,
+    "s1",
+    "console.log('hello'); console.error('bad'); 1 + 2",
+  )
+  .await;
+  assert_eq!(logged["result"], serde_json::json!(3));
+  assert_eq!(logged["stdout"], serde_json::json!(["hello"]));
+  assert_eq!(logged["stderr"], serde_json::json!(["bad"]));
+
+  let big = e2b_execute(&tb, "s1", "123n").await;
+  assert_eq!(big["result"], serde_json::Value::Null);
+  assert_eq!(big["result_type"], serde_json::json!("bigint"));
+  assert_eq!(big["result_repr"], serde_json::json!("123n"));
+
+  // A cycle must not fail the response.
+  let cyclic = e2b_execute(&tb, "s1", "const c = {}; c.self = c; c").await;
+  assert_eq!(cyclic["error"], serde_json::Value::Null);
+
+  // Cross-realm Map detection: `instanceof` would be false here.
+  let map = e2b_execute(&tb, "s1", "new Map([['k', 1]])").await;
+  assert_eq!(map["result_type"], serde_json::json!("map"));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_bounds_console_output() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let capped = e2b_execute(
+    &tb,
+    "output-cap",
+    "console.log('a'.repeat(65530)); console.error('overflow'); 'done'",
+  )
+  .await;
+  let output_bytes: usize = ["stdout", "stderr"]
+    .iter()
+    .flat_map(|stream| capped[*stream].as_array().unwrap())
+    .map(|line| line.as_str().unwrap().as_bytes().len())
+    .sum();
+  assert!(output_bytes <= 65536, "captured {output_bytes} bytes");
+  assert!(["stdout", "stderr"]
+    .iter()
+    .flat_map(|stream| capped[*stream].as_array().unwrap())
+    .any(|line| line == "[output truncated]"));
+
+  let unicode =
+    e2b_execute(&tb, "output-cap", "console.log('é'.repeat(32760)); 'done'")
+      .await;
+  let unicode_bytes: usize = ["stdout", "stderr"]
+    .iter()
+    .flat_map(|stream| unicode[*stream].as_array().unwrap())
+    .map(|line| line.as_str().unwrap().as_bytes().len())
+    .sum();
+  assert!(unicode_bytes <= 65536, "captured {unicode_bytes} bytes");
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_bounds_console_value_rendering() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let many_keys = e2b_execute(
+    &tb,
+    "bounded-values",
+    r#"
+      console.log('a'.repeat(65500));
+      const value = {};
+      for (let i = 0; i < 10000; i++) value[`k${i}`] = i;
+      console.log(value);
+      10
+    "#,
+  )
+  .await;
+  let output_bytes: usize = many_keys["stdout"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|line| line.as_str().unwrap().as_bytes().len())
+    .sum();
+  assert!(output_bytes <= 65536, "captured {output_bytes} bytes");
+  assert_eq!(many_keys["result"], serde_json::json!(10));
+  assert!(many_keys["stdout"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .any(|line| line == "[output truncated]"));
+
+  let huge_bigint =
+    e2b_execute(&tb, "bounded-values", "console.log(1n << 1_000_000n); 11")
+      .await;
+  assert_eq!(huge_bigint["result"], serde_json::json!(11));
+  assert_eq!(huge_bigint["stdout"], serde_json::json!(["[bigint]"]));
+
+  let hostile_proxy = e2b_execute(
+    &tb,
+    "bounded-values",
+    r#"
+      console.log(new Proxy({}, {
+        ownKeys() { throw new Error('ownKeys'); },
+      }));
+      12
+    "#,
+  )
+  .await;
+  assert_eq!(hostile_proxy["result"], serde_json::json!(12));
+  assert_eq!(hostile_proxy["stdout"], serde_json::json!(["[object]"]));
+  assert_eq!(hostile_proxy["error"], serde_json::Value::Null);
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_console_is_total_and_immutable() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let hostile = e2b_execute(
+    &tb,
+    "console-hardening",
+    r#"
+      const hostile = {
+        toJSON() { throw new Error('toJSON'); },
+        toString() { throw new Error('toString'); },
+      };
+      console.log(hostile);
+      7
+    "#,
+  )
+  .await;
+  assert_eq!(hostile["result"], serde_json::json!(7));
+  assert_eq!(hostile["stdout"], serde_json::json!(["[object]"]));
+
+  let benign = e2b_execute(
+    &tb,
+    "console-hardening",
+    "console.log(123n, { a: 1 }, [2]); 8",
+  )
+  .await;
+  assert_eq!(benign["result"], serde_json::json!(8));
+  assert_eq!(benign["stdout"], serde_json::json!([r#"123n {"a":1} [2]"#]));
+
+  let attempted = e2b_execute(
+    &tb,
+    "console-hardening",
+    r#"
+      Object.defineProperty(globalThis, 'console', {
+        configurable: true,
+        set() { throw new Error('poisoned console'); },
+      })
+    "#,
+  )
+  .await;
+  let after =
+    e2b_execute(&tb, "console-hardening", "console.log('still captured'); 9")
+      .await;
+  assert_eq!(
+    attempted["error"]["kind"],
+    serde_json::json!("runtime_error")
+  );
+  assert_eq!(after["result"], serde_json::json!(9));
+  assert_eq!(after["stdout"], serde_json::json!(["still captured"]));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_error_inspection_runs_no_user_code() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  e2b_execute(&tb, "errinspect", "globalThis.errorGetterRuns = 0").await;
+
+  // A getter on `name` must never be invoked while classifying the error. The
+  // counter is the observable proof: an infinite loop in this getter could not
+  // be interrupted, since it would run in host code outside any vm timeout.
+  let hostile_getter = e2b_execute(
+    &tb,
+    "errinspect",
+    r#"
+      const hostile = { message: 'readable' };
+      Object.defineProperty(hostile, 'name', {
+        get() {
+          globalThis.errorGetterRuns++;
+          return 'Attacker';
+        },
+      });
+      throw hostile
+    "#,
+  )
+  .await;
+  assert_eq!(
+    hostile_getter["error"]["kind"],
+    serde_json::json!("runtime_error")
+  );
+  assert_eq!(hostile_getter["error"]["name"], serde_json::json!("Error"));
+  assert_eq!(
+    hostile_getter["error"]["message"],
+    serde_json::json!("readable")
+  );
+
+  // A proxy's getOwnPropertyDescriptor trap is also user code.
+  let hostile_proxy = e2b_execute(
+    &tb,
+    "errinspect",
+    r#"
+      throw new Proxy({}, {
+        get() { globalThis.errorGetterRuns++; return 'trap'; },
+        getOwnPropertyDescriptor() {
+          globalThis.errorGetterRuns++;
+          throw new Error('trap');
+        },
+      })
+    "#,
+  )
+  .await;
+  assert_eq!(
+    hostile_proxy["error"]["kind"],
+    serde_json::json!("runtime_error")
+  );
+  assert_eq!(hostile_proxy["error"]["name"], serde_json::json!("Error"));
+
+  let getter_runs =
+    e2b_execute(&tb, "errinspect", "globalThis.errorGetterRuns").await;
+  assert_eq!(getter_runs["result"], serde_json::json!(0));
+
+  // Ordinary errors still report their real name and message.
+  let ordinary =
+    e2b_execute(&tb, "errinspect", "throw new TypeError('boom')").await;
+  assert_eq!(
+    ordinary["error"]["kind"],
+    serde_json::json!("runtime_error")
+  );
+  assert_eq!(ordinary["error"]["name"], serde_json::json!("TypeError"));
+  assert_eq!(ordinary["error"]["message"], serde_json::json!("boom"));
+
+  // The sandbox survives every hostile throw above.
+  let alive = e2b_execute(&tb, "errinspect", "1 + 1").await;
+  assert_eq!(alive["result"], serde_json::json!(2));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_survives_nested_ops_from_user_code() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  e2b_execute(&tb, "nested", "let alive = 5").await;
+
+  // `new URL(...)` reaches deno_url's op_url_parse, which needs a mutable
+  // OpState borrow. While the vm run op held that borrow across user code, this
+  // aborted the entire runtime process rather than returning a value.
+  let parsed =
+    e2b_execute(&tb, "nested", "new URL('https://example.com/path').host")
+      .await;
+  assert_eq!(parsed["error"], serde_json::Value::Null);
+  assert_eq!(parsed["result"], serde_json::json!("example.com"));
+
+  // The sandbox boundary shadows the host `fetch` global, so calling it fails
+  // as an ordinary user-code error rather than reaching network access.
+  let fetched =
+    e2b_execute(&tb, "nested", "fetch('https://example.com')").await;
+  assert_eq!(fetched["error"]["kind"], serde_json::json!("runtime_error"));
+
+  // The worker and its state survived both.
+  assert_eq!(
+    e2b_execute(&tb, "nested", "alive").await["result"],
+    serde_json::json!(5)
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_serialization_budget_is_shared() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  // 4 levels of 12 shared references stays inside SERIALIZE_MAX_DEPTH (8) and
+  // well under the per-level entry cap (1000), so neither of those can truncate
+  // it. Total nodes reached is ~22.6k, so the shared node budget is the only
+  // mechanism that can produce a truncated marker here.
+  let shared_dag = e2b_execute(
+    &tb,
+    "budget",
+    r#"
+      let level = { leaf: true };
+      for (let depth = 0; depth < 4; depth++) {
+        const next = {};
+        for (let index = 0; index < 12; index++) next['k' + index] = level;
+        level = next;
+      }
+      level
+    "#,
+  )
+  .await;
+  assert_eq!(shared_dag["error"], serde_json::Value::Null);
+  assert_eq!(shared_dag["result_type"], serde_json::json!("object"));
+  // Report only the length on failure: an unbounded traversal serializes a tree
+  // far too large to put in CI logs.
+  let serialized = shared_dag["result"].to_string();
+  assert!(
+    serialized.contains("[truncated]"),
+    "shared budget should truncate a combinatorial DAG; serialized {} chars \
+     with no marker",
+    serialized.len()
+  );
+
+  // A single fully populated level must still serialize completely, so the
+  // shared budget does not weaken the documented per-level guarantee.
+  let flat = e2b_execute(
+    &tb,
+    "budget",
+    "Array.from({ length: 1000 }, (_unused, index) => index)",
+  )
+  .await;
+  assert_eq!(flat["result_type"], serde_json::json!("array"));
+  let flat_items = flat["result"].as_array().expect("array result");
+  assert_eq!(flat_items.len(), 1000);
+  assert_eq!(flat_items[999], serde_json::json!(999));
+
+  let alive = e2b_execute(&tb, "budget", "1 + 1").await;
+  assert_eq!(alive["result"], serde_json::json!(2));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_serialization_is_total_and_bounded() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  for code in [
+    r#"
+      const hostile = {};
+      Object.defineProperty(hostile, Symbol.toStringTag, {
+        get() { throw new Error('brand'); },
+      });
+      hostile
+    "#,
+    r#"
+      globalThis.serializationGetterRuns = 0;
+      const hostileGetter = {};
+      Object.defineProperty(hostileGetter, 'value', {
+        enumerable: true,
+        get() {
+          globalThis.serializationGetterRuns++;
+          throw new Error('property');
+        },
+      });
+      hostileGetter
+    "#,
+  ] {
+    let hostile = e2b_execute(&tb, "serialization", code).await;
+    assert_eq!(hostile["result"], serde_json::Value::Null);
+    assert_eq!(hostile["result_type"], serde_json::json!("unserializable"));
+    assert_eq!(
+      hostile["result_repr"],
+      serde_json::json!("[unserializable]")
+    );
+    assert_eq!(hostile["error"], serde_json::Value::Null);
+  }
+
+  let getter_runs =
+    e2b_execute(&tb, "serialization", "globalThis.serializationGetterRuns")
+      .await;
+  assert_eq!(getter_runs["result"], serde_json::json!(0));
+
+  let hostile_proxy = e2b_execute(
+    &tb,
+    "serialization",
+    r#"
+      globalThis.serializationProxyTrapRuns = 0;
+      new Proxy({}, {
+        get(_target, property) {
+          if (property === 'then') return undefined;
+          globalThis.serializationProxyTrapRuns++;
+          throw new Error('get trap');
+        },
+        ownKeys() {
+          globalThis.serializationProxyTrapRuns++;
+          throw new Error('ownKeys trap');
+        },
+        getOwnPropertyDescriptor() {
+          globalThis.serializationProxyTrapRuns++;
+          throw new Error('descriptor trap');
+        },
+        getPrototypeOf() {
+          globalThis.serializationProxyTrapRuns++;
+          throw new Error('prototype trap');
+        },
+      })
+    "#,
+  )
+  .await;
+  assert_eq!(hostile_proxy["result"], serde_json::Value::Null);
+  assert_eq!(
+    hostile_proxy["result_type"],
+    serde_json::json!("unserializable")
+  );
+  assert_eq!(hostile_proxy["error"], serde_json::Value::Null);
+  let proxy_trap_runs = e2b_execute(
+    &tb,
+    "serialization",
+    "globalThis.serializationProxyTrapRuns",
+  )
+  .await;
+  assert_eq!(proxy_trap_runs["result"], serde_json::json!(0));
+
+  let poisoned_array_methods = e2b_execute(
+    &tb,
+    "array-intrinsics",
+    r#"
+      Array.prototype.slice = () => [1n];
+      Array.prototype.map = () => 1n;
+      [1, { nested: 2 }]
+    "#,
+  )
+  .await;
+  assert_eq!(
+    poisoned_array_methods["result"],
+    serde_json::json!([1, { "nested": 2 }])
+  );
+  assert_eq!(
+    poisoned_array_methods["result_type"],
+    serde_json::json!("array")
+  );
+  assert_eq!(poisoned_array_methods["error"], serde_json::Value::Null);
+
+  let hostile_array_proxy = e2b_execute(
+    &tb,
+    "array-proxy",
+    r#"
+      new Proxy([], {
+        getOwnPropertyDescriptor() {
+          throw new Error('descriptor');
+        },
+      })
+    "#,
+  )
+  .await;
+  assert_eq!(hostile_array_proxy["result"], serde_json::Value::Null);
+  assert_eq!(
+    hostile_array_proxy["result_type"],
+    serde_json::json!("unserializable")
+  );
+  assert_eq!(hostile_array_proxy["error"], serde_json::Value::Null);
+
+  for (code, expected_type, expected_repr) in [
+    (
+      "function named() {}; named",
+      "function",
+      "[Function: named]",
+    ),
+    ("Symbol('value')", "symbol", "Symbol(value)"),
+    ("new Error('boom')", "error", "Error: boom"),
+    ("new TypeError('typed')", "error", "TypeError: typed"),
+    ("new Date(0)", "date", "1970-01-01T00:00:00.000Z"),
+    ("new Map([['key', 1]])", "map", "[map size=1]"),
+    ("new Set([1, 2])", "set", "[set size=2]"),
+  ] {
+    let serialized = e2b_execute(&tb, "serialization", code).await;
+    assert_eq!(serialized["result_type"], serde_json::json!(expected_type));
+    assert_eq!(serialized["result_repr"], serde_json::json!(expected_repr));
+  }
+
+  let huge_bigint = e2b_execute(&tb, "serialization", "1n << 1_000_000n").await;
+  assert_eq!(huge_bigint["result"], serde_json::Value::Null);
+  assert_eq!(huge_bigint["result_type"], serde_json::json!("bigint"));
+  assert_eq!(huge_bigint["result_repr"], serde_json::json!("[bigint]"));
+
+  let deep = e2b_execute(
+    &tb,
+    "serialization",
+    r#"
+      const root = {};
+      let cursor = root;
+      for (let i = 0; i < 8; i++) {
+        cursor.next = {};
+        cursor = cursor.next;
+      }
+      root
+    "#,
+  )
+  .await;
+  let deep_path = "/next".repeat(8);
+  assert_eq!(
+    deep["result"].pointer(&deep_path),
+    Some(&serde_json::json!({
+      "value": null,
+      "type": "truncated",
+      "repr": "[truncated]",
+    }))
+  );
+
+  let broad = e2b_execute(
+    &tb,
+    "serialization",
+    "Object.fromEntries(Array.from({ length: 100_000 }, (_, i) => [`k${i}`, i]))",
+  )
+  .await;
+  assert_eq!(
+    broad["result"]["[truncated]"],
+    serde_json::json!({
+      "value": null,
+      "type": "truncated",
+      "repr": "[truncated]",
+    })
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_timeouts_keep_sandbox_usable() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  e2b_execute(&tb, "timeouts", "let keep = 7").await;
+  // A bystander sandbox: a spin loop must not cost anyone else their state,
+  // even though on one worker thread it does stall them until the vm timeout.
+  e2b_execute(&tb, "bystander", "let mine = 'intact'").await;
+
+  let async_ok = e2b_execute(&tb, "timeouts", "Promise.resolve(42)").await;
+  assert_eq!(async_ok["result"], serde_json::json!(42));
+
+  let awaited_refs = e2b_execute_with_env(
+    &tb,
+    "timeouts",
+    r#"
+      new Promise((resolve) => setTimeout(() => {
+        console.log(process.env.AWAITED_VALUE);
+        resolve(process.env.AWAITED_VALUE);
+      }, 10))
+    "#,
+    serde_json::json!({ "AWAITED_VALUE": "still-active" }),
+  )
+  .await;
+  assert_eq!(awaited_refs["result"], serde_json::json!("still-active"));
+  assert_eq!(awaited_refs["stdout"], serde_json::json!(["still-active"]));
+
+  let spin = e2b_execute(&tb, "timeouts", "while (true) {}").await;
+  assert_eq!(
+    spin["error"]["kind"],
+    serde_json::json!("execution_timeout")
+  );
+
+  // Recovery, not isolation-in-time: the aborted execution must leave another
+  // sandbox able to answer, with its own state.
+  let bystander = e2b_execute(&tb, "bystander", "mine").await;
+  assert_eq!(bystander["result"], serde_json::json!("intact"));
+
+  let spoofed_timeout = e2b_execute(
+    &tb,
+    "timeouts",
+    "throw new Error('Script execution timed out')",
+  )
+  .await;
+  assert_eq!(
+    spoofed_timeout["error"]["kind"],
+    serde_json::json!("runtime_error")
+  );
+
+  let runtime_syntax = e2b_execute(
+    &tb,
+    "timeouts",
+    "throw new SyntaxError('runtime syntax error')",
+  )
+  .await;
+  assert_eq!(
+    runtime_syntax["error"]["kind"],
+    serde_json::json!("runtime_error")
+  );
+
+  let compile_syntax = e2b_execute(&tb, "timeouts", "let =").await;
+  assert_eq!(
+    compile_syntax["error"]["kind"],
+    serde_json::json!("compile_error")
+  );
+
+  let hang = e2b_execute(&tb, "timeouts", "new Promise(() => {})").await;
+  assert_eq!(
+    hang["error"]["kind"],
+    serde_json::json!("execution_timeout")
+  );
+
+  let rejected =
+    e2b_execute(&tb, "timeouts", "Promise.reject(new Error('promise boom'))")
+      .await;
+  assert_eq!(
+    rejected["error"]["kind"],
+    serde_json::json!("runtime_error")
+  );
+  assert_eq!(
+    rejected["error"]["message"],
+    serde_json::json!("promise boom")
+  );
+
+  for (code, message) in [
+    (
+      "({ get then() { throw new Error('then getter'); } })",
+      "then getter",
+    ),
+    (
+      "({ then() { throw new Error('then call'); } })",
+      "then call",
+    ),
+  ] {
+    let hostile = e2b_execute(&tb, "timeouts", code).await;
+    assert_eq!(hostile["error"]["kind"], serde_json::json!("runtime_error"));
+    assert_eq!(hostile["error"]["message"], serde_json::json!(message));
+  }
+
+  let stray =
+    e2b_execute(&tb, "timeouts", "Promise.reject(new Error('stray')); 43")
+      .await;
+  assert_eq!(stray["result"], serde_json::json!(43));
+
+  let survived = e2b_execute(&tb, "timeouts", "keep").await;
+  assert_eq!(survived["result"], serde_json::json!(7));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_timeout_cancels_only_its_execution_timers() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  e2b_execute(
+    &tb,
+    "timer-ownership",
+    "let earlier = 'pending'; let syncAbandoned = 0; let asyncAbandoned = 0",
+  )
+  .await;
+  let scheduled = e2b_execute(
+    &tb,
+    "timer-ownership",
+    "setTimeout(() => earlier = 'fired', 350); 'scheduled'",
+  )
+  .await;
+  assert_eq!(scheduled["result"], serde_json::json!("scheduled"));
+
+  let spin = e2b_execute(
+    &tb,
+    "timer-ownership",
+    "setTimeout(() => syncAbandoned = 1, 150); while (true) {}",
+  )
+  .await;
+  assert_eq!(
+    spin["error"]["kind"],
+    serde_json::json!("execution_timeout")
+  );
+
+  let hang = e2b_execute(
+    &tb,
+    "timer-ownership",
+    r#"
+      new Promise((resolve) => setTimeout(() => {
+        asyncAbandoned = 1;
+        resolve();
+      }, 300))
+    "#,
+  )
+  .await;
+  assert_eq!(
+    hang["error"]["kind"],
+    serde_json::json!("execution_timeout")
+  );
+
+  let state = e2b_execute(
+    &tb,
+    "timer-ownership",
+    r#"
+      new Promise((resolve) => setTimeout(() => resolve({
+        earlier,
+        syncAbandoned,
+        asyncAbandoned,
+      }), 150))
+    "#,
+  )
+  .await;
+  assert_eq!(
+    state["result"],
+    serde_json::json!({
+      "earlier": "fired",
+      "syncAbandoned": 0,
+      "asyncAbandoned": 0,
+    })
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_timer_facade_survives_sabotage() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let descriptor = e2b_execute(
+    &tb,
+    "timer-sabotage",
+    r#"
+      [
+        'setTimeout',
+        'clearTimeout',
+        'setInterval',
+        'clearInterval',
+      ].map((name) => {
+        const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+        return [
+          Object.hasOwn(globalThis, name),
+          descriptor?.writable,
+          descriptor?.configurable,
+        ];
+      })
+    "#,
+  )
+  .await;
+  assert_eq!(
+    descriptor["result"],
+    serde_json::json!([
+      [true, false, false],
+      [true, false, false],
+      [true, false, false],
+      [true, false, false],
+    ])
+  );
+
+  let sabotage = e2b_execute(
+    &tb,
+    "timer-sabotage",
+    r#"
+      try { setTimeout = () => { throw new Error('poisoned'); }; } catch (_) {}
+      try { clearTimeout = () => { throw new Error('poisoned'); }; } catch (_) {}
+      try { setInterval = () => { throw new Error('poisoned'); }; } catch (_) {}
+      try { clearInterval = () => { throw new Error('poisoned'); }; } catch (_) {}
+      try {
+        Object.defineProperty(globalThis, 'setTimeout', {
+          value: () => { throw new Error('poisoned'); },
+          configurable: false,
+        });
+      } catch (_) {}
+      try { Object.setPrototypeOf(globalThis, null); } catch (_) {}
+      'attempted'
+    "#,
+  )
+  .await;
+  assert_eq!(sabotage["result"], serde_json::json!("attempted"));
+
+  let after = e2b_execute(
+    &tb,
+    "timer-sabotage",
+    r#"
+      new Promise((resolve) => {
+        const cancelled = setTimeout(() => resolve('clearTimeout failed'), 50);
+        clearTimeout(cancelled);
+        const interval = setInterval(() => {
+          clearInterval(interval);
+          setTimeout(() => resolve('timers-ok'), 10);
+        }, 10);
+      })
+    "#,
+  )
+  .await;
+  assert_eq!(
+    after["result"],
+    serde_json::json!("timers-ok"),
+    "response: {after}",
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_timer_callback_keeps_owner_state() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let scheduled = e2b_execute_with_env(
+    &tb,
+    "timer-callback-owner",
+    r#"
+      globalThis.timerEnv = 'pending';
+      setTimeout(() => {
+        globalThis.timerEnv = process.env.REQUEST_NAME;
+        console.log(`old:${process.env.REQUEST_NAME}`);
+      }, 40);
+      'scheduled'
+    "#,
+    serde_json::json!({ "REQUEST_NAME": "origin" }),
+  )
+  .await;
+  assert_eq!(scheduled["result"], serde_json::json!("scheduled"));
+  assert_eq!(scheduled["stdout"], serde_json::json!([]));
+
+  let later = e2b_execute_with_env(
+    &tb,
+    "timer-callback-owner",
+    r#"
+      new Promise((resolve) => setTimeout(() => {
+        console.log(`new:${process.env.REQUEST_NAME}`);
+        resolve([process.env.REQUEST_NAME, globalThis.timerEnv]);
+      }, 80))
+    "#,
+    serde_json::json!({ "REQUEST_NAME": "newer" }),
+  )
+  .await;
+  assert_eq!(later["result"], serde_json::json!(["newer", "origin"]));
+  assert_eq!(later["stdout"], serde_json::json!(["new:newer"]));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_contains_timer_callback_errors() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  e2b_execute(
+    &tb,
+    "timer-errors",
+    "let timerErrorState = 0; let lateTimerState = 0",
+  )
+  .await;
+
+  let awaited = e2b_execute(
+    &tb,
+    "timer-errors",
+    r#"
+      new Promise(() => setTimeout(() => {
+        timerErrorState = 1;
+        throw new Error('awaited timer boom');
+      }, 10))
+    "#,
+  )
+  .await;
+  assert_eq!(awaited["error"]["kind"], serde_json::json!("runtime_error"));
+  assert_eq!(
+    awaited["error"]["message"],
+    serde_json::json!("awaited timer boom")
+  );
+  let after_awaited = e2b_execute(&tb, "timer-errors", "timerErrorState").await;
+  assert_eq!(after_awaited["result"], serde_json::json!(1));
+
+  let scheduled = e2b_execute(
+    &tb,
+    "timer-errors",
+    r#"
+      setTimeout(() => {
+        lateTimerState = 2;
+        throw new Error('late timer boom');
+      }, 10);
+      'scheduled'
+    "#,
+  )
+  .await;
+  assert_eq!(scheduled["result"], serde_json::json!("scheduled"));
+
+  let after_late = e2b_execute(
+    &tb,
+    "timer-errors",
+    r#"
+      new Promise((resolve) => setTimeout(() => {
+        resolve([timerErrorState, lateTimerState]);
+      }, 40))
+    "#,
+  )
+  .await;
+  assert_eq!(after_late["result"], serde_json::json!([1, 2]));
+  assert_eq!(after_late["error"], serde_json::Value::Null);
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_cancels_orphaned_interval_after_success() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  // A successful execution starts an interval and returns. The interval's
+  // callback closure would otherwise retain this execution's capture buffer and
+  // env forever, ticking across every future execution — unbounded growth.
+  let started = e2b_execute(
+    &tb,
+    "orphan-interval",
+    "globalThis.ticks = 0; setInterval(() => globalThis.ticks++, 10); 'started'",
+  )
+  .await;
+  assert_eq!(started["result"], serde_json::json!("started"));
+
+  // Read the counter, wait past several interval periods, then read again. If
+  // the interval were still live it would keep incrementing between the reads.
+  let first = e2b_execute(&tb, "orphan-interval", "globalThis.ticks").await;
+  let second = e2b_execute(
+    &tb,
+    "orphan-interval",
+    "new Promise((resolve) => setTimeout(() => resolve(globalThis.ticks), 80))",
+  )
+  .await;
+  assert_eq!(
+    first["result"], second["result"],
+    "orphaned interval kept ticking after its execution settled: \
+     first={first}, second={second}",
+  );
+
+  // A one-shot timeout scheduled by a successful execution must still fire.
+  let scheduled = e2b_execute(
+    &tb,
+    "orphan-interval",
+    "globalThis.late = 'pending'; setTimeout(() => globalThis.late = 'fired', 20); 'ok'",
+  )
+  .await;
+  assert_eq!(scheduled["result"], serde_json::json!("ok"));
+  let observed = e2b_execute(
+    &tb,
+    "orphan-interval",
+    "new Promise((resolve) => setTimeout(() => resolve(globalThis.late), 60))",
+  )
+  .await;
+  assert_eq!(observed["result"], serde_json::json!("fired"));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_keeps_async_request_state_scoped() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (first, second) = tokio::join!(
+    e2b_execute_with_env(
+      &tb,
+      "async-scope",
+      r#"
+        new Promise((resolve) => setTimeout(() => {
+          console.log(process.env.REQUEST_NAME);
+          resolve(process.env.REQUEST_NAME);
+        }, 40))
+      "#,
+      serde_json::json!({ "REQUEST_NAME": "first" }),
+    ),
+    e2b_execute_with_env(
+      &tb,
+      "async-scope",
+      r#"
+        new Promise((resolve) => setTimeout(() => {
+          console.log(process.env.REQUEST_NAME);
+          resolve(process.env.REQUEST_NAME);
+        }, 10))
+      "#,
+      serde_json::json!({ "REQUEST_NAME": "second" }),
+    ),
+  );
+
+  assert_eq!(first["result"], serde_json::json!("first"));
+  assert_eq!(first["stdout"], serde_json::json!(["first"]));
+  assert_eq!(second["result"], serde_json::json!("second"));
+  assert_eq!(second["stdout"], serde_json::json!(["second"]));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_serializes_results_before_releasing_queue() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (first, second) = tokio::join!(
+    e2b_execute(
+      &tb,
+      "serialized-result",
+      r#"
+        globalThis.sharedResult = { value: 1 };
+        new Promise((resolve) => setTimeout(() => resolve(sharedResult), 40))
+      "#,
+    ),
+    async {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+      e2b_execute(
+        &tb,
+        "serialized-result",
+        r#"
+          sharedResult.value = 2;
+          new Promise((resolve) => setTimeout(() => resolve(sharedResult.value), 20))
+        "#,
+      )
+      .await
+    },
+  );
+
+  assert_eq!(first["result"], serde_json::json!({ "value": 1 }));
+  assert_eq!(second["result"], serde_json::json!(2));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_queue_recovers_from_rejected_execution() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  e2b_execute(&tb, "queued-rejection", "let queuedState = 0").await;
+  let (rejected, successor) = tokio::join!(
+    e2b_execute(
+      &tb,
+      "queued-rejection",
+      r#"
+        new Promise((_, reject) => setTimeout(() => {
+          reject(new Error('queued boom'));
+        }, 40))
+      "#,
+    ),
+    async {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+      e2b_execute(&tb, "queued-rejection", "queuedState += 1; queuedState")
+        .await
+    },
+  );
+
+  assert_eq!(
+    rejected["error"]["kind"],
+    serde_json::json!("runtime_error")
+  );
+  assert_eq!(
+    rejected["error"]["message"],
+    serde_json::json!("queued boom")
+  );
+  assert_eq!(successor["result"], serde_json::json!(1));
+  let survived = e2b_execute(&tb, "queued-rejection", "queuedState").await;
+  assert_eq!(survived["result"], serde_json::json!(1));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_concurrent_first_requests_create_one_worker() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (first, second) = tokio::join!(
+    e2b_execute_with_baseline_env(
+      &tb,
+      "concurrent",
+      "process.env.BASELINE",
+      r#"{"BASELINE":"initialized"}"#,
+    ),
+    e2b_execute_with_baseline_env(
+      &tb,
+      "concurrent",
+      "process.env.BASELINE",
+      r#"{"BASELINE":"initialized"}"#,
+    ),
+  );
+  assert_eq!(first["result"], serde_json::json!("initialized"));
+  assert_eq!(second["result"], serde_json::json!("initialized"));
+  assert_eq!(first["error"], serde_json::Value::Null);
+  assert_eq!(second["error"], serde_json::Value::Null);
+
+  let mut resp = tb
+    .request(|b| {
+      b.uri("/internal/harness/worker-creation-count")
+        .header("x-sandbox-id", "concurrent")
+        .body(Body::empty())
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+  assert_eq!(resp.status().as_u16(), StatusCode::OK);
+
+  let bytes = to_bytes(resp.body_mut()).await.unwrap();
+  let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+  assert_eq!(body["count"], serde_json::json!(1));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+async fn e2b_execute_raw(
+  tb: &TestBed,
+  sandbox: &str,
+  raw_body: &str,
+) -> (u16, serde_json::Value) {
+  let owned = raw_body.to_string();
+  let mut resp = tb
+    .request(move |b| {
+      b.uri("/internal/execute")
+        .method("POST")
+        .header("x-sandbox-id", sandbox)
+        .header("content-type", "application/json")
+        .body(Body::from(owned.clone()))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+
+  let status = resp.status().as_u16();
+  let bytes = to_bytes(resp.body_mut()).await.unwrap();
+  let json = if bytes.is_empty() {
+    serde_json::Value::Null
+  } else {
+    serde_json::from_slice(&bytes).unwrap()
+  };
+  (status, json)
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_rejects_malformed_body() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  // Unparseable JSON: an unguarded req.json() would throw and 500. It must be a
+  // structured 400 instead.
+  let (status, body) = e2b_execute_raw(&tb, "malformed", "not json {").await;
+  assert_eq!(status, 400, "got: {body}");
+  assert_eq!(body["error"]["kind"], serde_json::json!("invalid_request"));
+
+  // A literal JSON null parses but is not an object; destructuring it would
+  // also 500 without the object guard.
+  let (status, body) = e2b_execute_raw(&tb, "malformed", "null").await;
+  assert_eq!(status, 400, "got: {body}");
+  assert_eq!(body["error"]["kind"], serde_json::json!("invalid_request"));
+
+  // The executor is still serving after the bad requests.
+  let ok = e2b_execute(&tb, "malformed", "1 + 1").await;
+  assert_eq!(ok["result"], serde_json::json!(2));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_serializes_proto_key_as_data() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-harness")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  // An own enumerable property literally named "__proto__" must round-trip as a
+  // data property. A plain `out[key] = value` would retarget the output
+  // object's prototype and drop the value.
+  let result = e2b_execute(
+    &tb,
+    "proto",
+    r#"
+      const out = {};
+      Object.defineProperty(out, "__proto__", {
+        value: 42,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+      out
+    "#,
+  )
+  .await;
+  assert_eq!(
+    result["result"]["__proto__"],
+    serde_json::json!(42),
+    "response: {result}",
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_executor_falls_back_on_invalid_numeric_config() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-executor-bad-config")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  // EXECUTOR_ASYNC_TIMEOUT_MS is non-numeric. A NaN async timeout would fire
+  // immediately and time out this 50ms-resolved promise; the validated default
+  // (12000ms) lets it resolve.
+  let async_ok = e2b_execute(
+    &tb,
+    "bad-config",
+    "new Promise((resolve) => setTimeout(() => resolve(99), 50))",
+  )
+  .await;
+  assert_eq!(async_ok["result"], serde_json::json!(99), "got: {async_ok}");
+
+  // SERIALIZE_MAX_ENTRIES is non-numeric. A NaN entry cap serializes arrays
+  // empty (min(length, NaN) is NaN); the validated default serializes fully.
+  let array = e2b_execute(&tb, "bad-config", "[1, 2, 3]").await;
+  assert_eq!(
+    array["result"],
+    serde_json::json!([1, 2, 3]),
+    "got: {array}"
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+async fn e2b_adapter_post(
+  tb: &TestBed,
+  path: &str,
+  body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+  let mut resp = tb
+    .request(|b| {
+      b.uri(path)
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .body(Body::from(body.to_string()))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+
+  let status = resp.status().as_u16();
+  let bytes = to_bytes(resp.body_mut()).await.unwrap();
+  let json = if bytes.is_empty() {
+    serde_json::Value::Null
+  } else {
+    serde_json::from_slice(&bytes).unwrap()
+  };
+  (status, json)
+}
+
+async fn e2b_adapter_jupyter_post(
+  tb: &TestBed,
+  sandbox: &str,
+  token: Option<&str>,
+  body: serde_json::Value,
+) -> (u16, String) {
+  let mut response = tb
+    .request(|builder| {
+      let builder = builder
+        .uri(format!("/sandboxes/{sandbox}/jupyter/execute"))
+        .method("POST")
+        .header("content-type", "application/json");
+      let builder = match token {
+        Some(token) => builder.header("x-access-token", token),
+        None => builder,
+      };
+      builder
+        .body(Body::from(body.to_string()))
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+  let status = response.status().as_u16();
+  if status == 200 {
+    assert_eq!(
+      response.headers().get("content-type").unwrap(),
+      "application/x-ndjson"
+    );
+  }
+  let text =
+    String::from_utf8(to_bytes(response.body_mut()).await.unwrap().to_vec())
+      .unwrap();
+  (status, text)
+}
+
+fn e2b_jupyter_events(body: &str) -> Vec<serde_json::Value> {
+  body
+    .lines()
+    .map(|line| serde_json::from_str(line).unwrap())
+    .collect()
+}
+
+async fn e2b_adapter_execute(
+  tb: &TestBed,
+  context_id: &str,
+  code: &str,
+) -> serde_json::Value {
+  let (status, body) = e2b_adapter_post(
+    tb,
+    "/execute",
+    serde_json::json!({
+      "code": code,
+      "context_id": context_id,
+      "language": "javascript",
+    }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {body}");
+  body
+}
+
+async fn e2b_adapter_get(tb: &TestBed, path: &str) -> (u16, serde_json::Value) {
+  let mut resp = tb
+    .request(|b| {
+      b.uri(path)
+        .method("GET")
+        .header("x-api-key", "test-key")
+        .body(Body::empty())
+        .context("can't make request")
+    })
+    .await
+    .unwrap();
+
+  let status = resp.status().as_u16();
+  let bytes = to_bytes(resp.body_mut()).await.unwrap();
+  let json = if bytes.is_empty() {
+    serde_json::Value::Null
+  } else {
+    serde_json::from_slice(&bytes).unwrap()
+  };
+  (status, json)
+}
+
+async fn e2b_adapter_delete(tb: &TestBed, path: &str) -> u16 {
+  tb.request(|b| {
+    b.uri(path)
+      .method("DELETE")
+      .header("x-api-key", "test-key")
+      .body(Body::empty())
+      .context("can't make request")
+  })
+  .await
+  .unwrap()
+  .status()
+  .as_u16()
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_creates_code_interpreter_tokens_without_leaking_them()
+{
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (first_status, first) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "code-interpreter-v1" }),
+  )
+  .await;
+  let (second_status, second) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "code-interpreter-v1" }),
+  )
+  .await;
+
+  assert_eq!(first_status, 201, "got: {first}");
+  assert_eq!(second_status, 201, "got: {second}");
+  let first_token = first["envdAccessToken"].as_str().unwrap();
+  let second_token = second["envdAccessToken"].as_str().unwrap();
+  assert!(!first_token.is_empty());
+  assert_ne!(first_token, second_token);
+
+  let id = first["sandboxID"].as_str().unwrap();
+  let (get_status, details) =
+    e2b_adapter_get(&tb, &format!("/sandboxes/{id}")).await;
+  assert_eq!(get_status, 200);
+  assert!(details.get("envdAccessToken").is_none());
+
+  let (list_status, sandboxes) = e2b_adapter_get(&tb, "/sandboxes").await;
+  assert_eq!(list_status, 200);
+  assert!(sandboxes
+    .as_array()
+    .unwrap()
+    .iter()
+    .all(|entry| entry.get("envdAccessToken").is_none()));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_jupyter_preserves_state_and_emits_ndjson_events() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({
+      "templateID": "code-interpreter-v1",
+      "envVars": { "BASE": "base" },
+    }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {created}");
+  let sandbox = created["sandboxID"].as_str().unwrap();
+  let token = created["envdAccessToken"].as_str().unwrap();
+
+  let (status, first) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({
+      "code": "x = 1",
+      "context_id": null,
+      "language": null,
+      "env_vars": null,
+    }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {first}");
+  let first_events = e2b_jupyter_events(&first);
+  assert_eq!(first_events.len(), 1, "got: {first}");
+  assert_eq!(first_events[0]["type"], serde_json::json!("result"));
+  assert_eq!(first_events[0]["text"], serde_json::json!("1"));
+
+  let (status, declaration) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({ "code": "let y = 1" }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {declaration}");
+  assert_eq!(declaration, "");
+
+  let (status, second) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({
+      "code": "console.log('out'); console.error('err'); x += 1; x",
+      "context_id": null,
+      "language": null,
+      "env_vars": null,
+    }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {second}");
+  assert!(second.ends_with('\n'));
+  let events = e2b_jupyter_events(&second);
+  assert_eq!(events.len(), 3, "got: {second}");
+  assert_eq!(events[0]["type"], serde_json::json!("stdout"));
+  assert_eq!(events[0]["text"], serde_json::json!("out"));
+  assert!(events[0]["timestamp"].is_u64());
+  assert_eq!(events[1]["type"], serde_json::json!("stderr"));
+  assert_eq!(events[1]["text"], serde_json::json!("err"));
+  assert!(events[1]["timestamp"].is_u64());
+  assert_eq!(events[2]["type"], serde_json::json!("result"));
+  assert_eq!(events[2]["text"], serde_json::json!("2"));
+  assert_eq!(events[2]["json"], serde_json::json!(2));
+  assert_eq!(events[2]["is_main_result"], serde_json::json!(true));
+
+  let (status, declaration) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({ "code": "let keep = 3" }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {declaration}");
+  assert_eq!(declaration, "");
+
+  let (status, thrown) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({ "code": "throw new Error('boom')" }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {thrown}");
+  let thrown_events = e2b_jupyter_events(&thrown);
+  assert_eq!(thrown_events.len(), 1, "got: {thrown}");
+  assert_eq!(thrown_events[0]["type"], serde_json::json!("error"));
+  assert_eq!(thrown_events[0]["name"], serde_json::json!("Error"));
+  assert_eq!(thrown_events[0]["value"], serde_json::json!("boom"));
+  assert_eq!(
+    thrown_events[0]["traceback"],
+    serde_json::json!("Error: boom")
+  );
+
+  let (status, state) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({ "code": "keep" }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {state}");
+  assert_eq!(
+    e2b_jupyter_events(&state)[0]["text"],
+    serde_json::json!("3")
+  );
+
+  let (status, invalid) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({ "code": "let broken =" }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {invalid}");
+  let invalid_events = e2b_jupyter_events(&invalid);
+  assert_eq!(invalid_events.len(), 1, "got: {invalid}");
+  assert_eq!(invalid_events[0]["type"], serde_json::json!("error"));
+
+  let (status, timed_out) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({ "code": "while (true) {}" }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {timed_out}");
+  let timeout_events = e2b_jupyter_events(&timed_out);
+  assert_eq!(timeout_events.len(), 1, "got: {timed_out}");
+  assert_eq!(timeout_events[0]["type"], serde_json::json!("error"));
+  assert!(
+    timeout_events[0]["value"]
+      .as_str()
+      .unwrap()
+      .to_ascii_lowercase()
+      .contains("timed out"),
+    "got: {timed_out}"
+  );
+
+  let (status, typed) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({
+      "code": "const typed: number = 4; typed",
+      "language": "typescript",
+    }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {typed}");
+  assert_eq!(e2b_jupyter_events(&typed)[0]["json"], serde_json::json!(4));
+
+  let (status, overridden) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({
+      "code": "`${process.env.BASE}:${process.env.ONLY}`",
+      "env_vars": { "BASE": "override", "ONLY": "once" },
+    }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {overridden}");
+  assert_eq!(
+    e2b_jupyter_events(&overridden)[0]["text"],
+    serde_json::json!("override:once")
+  );
+
+  let (status, restored) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({
+      "code": "`${process.env.BASE}:${typeof process.env.ONLY}`",
+    }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {restored}");
+  assert_eq!(
+    e2b_jupyter_events(&restored)[0]["text"],
+    serde_json::json!("base:undefined")
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_jupyter_authenticates_and_validates_before_execution()
+{
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, unknown) = e2b_adapter_jupyter_post(
+    &tb,
+    "never-existed",
+    None,
+    serde_json::json!({ "code": "1" }),
+  )
+  .await;
+  assert_eq!(status, 404, "got: {unknown}");
+  assert_eq!(
+    serde_json::from_str::<serde_json::Value>(&unknown).unwrap()["error_code"],
+    serde_json::json!("sandbox_not_found")
+  );
+
+  let (status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "code-interpreter-v1" }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {created}");
+  let sandbox = created["sandboxID"].as_str().unwrap();
+  let token = created["envdAccessToken"].as_str().unwrap();
+
+  for candidate in [None, Some(""), Some("wrong"), Some("test-key")] {
+    let (status, unauthorized) = e2b_adapter_jupyter_post(
+      &tb,
+      sandbox,
+      candidate,
+      serde_json::json!({ "code": "1" }),
+    )
+    .await;
+    assert_eq!(status, 401, "token {candidate:?} got: {unauthorized}");
+  }
+
+  let (status, language) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({
+      "code": "globalThis.ran = true",
+      "language": "python",
+    }),
+  )
+  .await;
+  assert_eq!(status, 400, "got: {language}");
+
+  let (status, marker) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({ "code": "typeof globalThis.ran" }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {marker}");
+  assert_eq!(
+    e2b_jupyter_events(&marker)[0]["text"],
+    serde_json::json!("undefined")
+  );
+
+  let (status, context) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({
+      "code": "globalThis.ran = true",
+      "context_id": "other",
+    }),
+  )
+  .await;
+  assert_eq!(status, 400, "got: {context}");
+
+  let (status, marker) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({ "code": "typeof globalThis.ran" }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {marker}");
+  assert_eq!(
+    e2b_jupyter_events(&marker)[0]["text"],
+    serde_json::json!("undefined")
+  );
+
+  for body in [
+    serde_json::json!({ "language": "javascript" }),
+    serde_json::json!({ "code": "1", "env_vars": { "BAD": 1 } }),
+    serde_json::json!({ "code": "x".repeat(300_000) }),
+    serde_json::json!({
+      "code": "1",
+      "env_vars": { "PAD": "x".repeat(600_000) },
+    }),
+  ] {
+    let (status, rejected) =
+      e2b_adapter_jupyter_post(&tb, sandbox, Some(token), body).await;
+    assert_eq!(status, 400, "got: {rejected}");
+  }
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_jupyter_returns_404_after_kill_or_ttl() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, killed) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "code-interpreter-v1" }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {killed}");
+  let killed_id = killed["sandboxID"].as_str().unwrap();
+  let killed_token = killed["envdAccessToken"].as_str().unwrap();
+  assert_eq!(
+    e2b_adapter_delete(&tb, &format!("/sandboxes/{killed_id}")).await,
+    204
+  );
+  let (status, body) = e2b_adapter_jupyter_post(
+    &tb,
+    killed_id,
+    Some(killed_token),
+    serde_json::json!({ "code": "1" }),
+  )
+  .await;
+  assert_eq!(status, 404, "got: {body}");
+
+  let (status, expiring) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({
+      "templateID": "code-interpreter-v1",
+      "timeout": 0.2,
+    }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {expiring}");
+  let expiring_id = expiring["sandboxID"].as_str().unwrap();
+  let expiring_token = expiring["envdAccessToken"].as_str().unwrap();
+  sleep(Duration::from_millis(350)).await;
+  let (status, body) = e2b_adapter_jupyter_post(
+    &tb,
+    expiring_id,
+    Some(expiring_token),
+    serde_json::json!({ "code": "1" }),
+  )
+  .await;
+  assert_eq!(status, 404, "got: {body}");
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_jupyter_reaps_an_unresponsive_executor() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-deadline")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "code-interpreter-v1" }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {created}");
+  let sandbox = created["sandboxID"].as_str().unwrap();
+  let token = created["envdAccessToken"].as_str().unwrap();
+
+  let started = std::time::Instant::now();
+  let (status, failed) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({
+      "code": "function f() { Promise.resolve().then(f) } f(); 1",
+    }),
+  )
+  .await;
+  let elapsed = started.elapsed();
+  assert_eq!(status, 500, "got: {failed}");
+  assert_eq!(
+    serde_json::from_str::<serde_json::Value>(&failed).unwrap()["error_code"],
+    serde_json::json!("internal_server_error")
+  );
+  assert!(
+    elapsed < Duration::from_secs(10),
+    "the adapter deadline did not fire; took {elapsed:?}"
+  );
+
+  let (status, gone) = e2b_adapter_jupyter_post(
+    &tb,
+    sandbox,
+    Some(token),
+    serde_json::json!({ "code": "1" }),
+  )
+  .await;
+  assert_eq!(status, 404, "got: {gone}");
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_rejects_oversized_bodies_before_buffering() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (_status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  let sandbox = created["sandboxID"].as_str().unwrap().to_string();
+
+  // Over MAX_REQUEST_BYTES (512KB). The main worker has no memory limit, so
+  // buffering this before checking would risk OOM-ing the control plane for
+  // every tenant.
+  let (status, body) = e2b_adapter_post(
+    &tb,
+    "/execute",
+    serde_json::json!({
+      "code": "1",
+      "context_id": sandbox,
+      "language": "javascript",
+      "env_vars": { "PAD": "x".repeat(600_000) },
+    }),
+  )
+  .await;
+  assert_eq!(status, 400, "got: {body}");
+  assert_eq!(body["error_code"], serde_json::json!("invalid_request"));
+
+  // Ordinary requests still work, and the adapter is still serving.
+  assert_eq!(
+    e2b_adapter_execute(&tb, &sandbox, "1 + 1").await["result"],
+    serde_json::json!(2)
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_never_shares_an_isolate() {
+  // Under the oneshot policy the pool ignores forceCreate and may hand back an
+  // existing worker, which would put two sandboxes in one isolate: state would
+  // leak across tenants and deleting either would kill both. Assert the
+  // PROPERTY rather than the mechanism — whether the pool avoids reuse or the
+  // adapter's duplicate-key guard refuses it, no two live sandboxes may see
+  // each other's state.
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_oneshot_policy(None)
+    .build()
+    .await;
+
+  // One execute per sandbox, and the status is inspected rather than asserted:
+  // the oneshot pool retires the executor after boot, so every execute here
+  // fails. What must hold regardless is that a failure is a loud API error —
+  // never another tenant's state. Claiming the marker and reading it back in
+  // the same execution is what would expose a shared isolate.
+  let mut created_count = 0;
+  for index in 0..3 {
+    let (status, created) = e2b_adapter_post(
+      &tb,
+      "/sandboxes",
+      serde_json::json!({ "templateID": "base" }),
+    )
+    .await;
+    // 500 is the guard refusing a reused worker, which is also acceptable.
+    assert!(status == 201 || status == 500, "got {status}: {created}");
+    if status != 201 {
+      continue;
+    }
+    created_count += 1;
+
+    let id = created["sandboxID"].as_str().unwrap();
+    let (status, body) = e2b_adapter_post(
+      &tb,
+      "/execute",
+      serde_json::json!({
+        "code": format!(
+          "if (globalThis.owner === undefined) globalThis.owner = {index}; \
+           globalThis.owner"
+        ),
+        "context_id": id,
+        "language": "javascript",
+      }),
+    )
+    .await;
+
+    if status == 200 && body["error"].is_null() {
+      assert_eq!(
+        body["result"],
+        serde_json::json!(index),
+        "sandbox {id} shares an isolate with another tenant: {body}"
+      );
+    } else {
+      assert!(
+        status == 410 || status == 500,
+        "sandbox {id} failed in an unexpected way: {status} {body}"
+      );
+    }
+  }
+
+  assert!(created_count > 0, "no sandbox was created at all");
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_duplicate_key_does_not_terminate_active_sandbox() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-duplicate-key")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, first) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {first}");
+  let sandbox = first["sandboxID"].as_str().expect("sandboxID");
+
+  let (status, duplicate) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(status, 500, "got: {duplicate}");
+
+  let (status, execution) = e2b_adapter_post(
+    &tb,
+    "/execute",
+    serde_json::json!({
+      "code": "1 + 2",
+      "context_id": sandbox,
+      "language": "javascript",
+    }),
+  )
+  .await;
+  assert_eq!(status, 200, "got: {execution}");
+  assert_eq!(execution["result"], serde_json::json!(3));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_reaps_an_unresponsive_executor() {
+  // The fixture pins a 300ms adapter deadline, so the adapter's own deadline is
+  // what fires rather than any executor-side timeout.
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-deadline")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (_status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  let sandbox = created["sandboxID"].as_str().unwrap().to_string();
+
+  // An infinite microtask loop uses only intrinsics, so no vm timeout can
+  // interrupt it. Without an enforced adapter deadline this request would hold
+  // the sandbox lock and a global slot until the cumulative CPU limit fired.
+  let started = std::time::Instant::now();
+  let (status, body) = e2b_adapter_post(
+    &tb,
+    "/execute",
+    serde_json::json!({
+      "code": "function f() { Promise.resolve().then(f) } f(); 1",
+      "context_id": sandbox,
+      "language": "javascript",
+    }),
+  )
+  .await;
+  let elapsed = started.elapsed();
+
+  assert_eq!(status, 410, "got: {body}");
+  assert_eq!(body["error_code"], serde_json::json!("sandbox_terminated"));
+  assert!(
+    elapsed < Duration::from_secs(10),
+    "the adapter deadline did not fire; took {elapsed:?}"
+  );
+
+  // The dead sandbox is reaped, and the adapter keeps serving.
+  let (status, gone) =
+    e2b_adapter_get(&tb, &format!("/sandboxes/{sandbox}")).await;
+  assert_eq!(status, 410, "got: {gone}");
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_bounds_a_hung_terminate() {
+  // The fixture's fake worker never settles `terminate()` when the sandbox env
+  // asks for "hang-terminate". Before the fix `ExecutorHandle.terminate`
+  // awaited that unbounded, so `registry.reap` (and the DELETE awaiting it)
+  // hung forever.
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-worker-fault")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({
+      "templateID": "base",
+      "envVars": { "__fault": "hang-terminate" },
+    }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {created}");
+  let sandbox = created["sandboxID"].as_str().unwrap().to_string();
+
+  let started = std::time::Instant::now();
+  let status = timeout(
+    Duration::from_secs(20),
+    e2b_adapter_delete(&tb, &format!("/sandboxes/{sandbox}")),
+  )
+  .await
+  .expect("a hung terminate blocked registry cleanup past its deadline");
+  let elapsed = started.elapsed();
+
+  assert_eq!(status, 204);
+  assert!(
+    elapsed < Duration::from_secs(10),
+    "the terminate deadline did not fire; took {elapsed:?}"
+  );
+
+  // The adapter keeps serving after bounding the hung terminate.
+  let (status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {created}");
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_retries_after_a_failed_bundle() {
+  // The fixture makes the first `EdgeRuntime.bundle` build reject, then
+  // delegates to the real op. Before the fix the rejected promise was cached by
+  // `??=` forever, so every future create 500ed until restart. Clearing the
+  // cache on rejection must let the retry succeed.
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-bundle-retry")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, body) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(
+    status, 500,
+    "the injected bundle failure should surface: {body}"
+  );
+  assert_eq!(
+    body["error_code"],
+    serde_json::json!("internal_server_error")
+  );
+
+  // The second create rebuilds the bundle and succeeds.
+  let (status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(
+    status, 201,
+    "the bundle cache was not cleared; got: {created}"
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_isolates_state_and_secrets() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let mut ids = vec![];
+  for _ in 0..2 {
+    let (_status, created) = e2b_adapter_post(
+      &tb,
+      "/sandboxes",
+      serde_json::json!({
+        "templateID": "base",
+        "envVars": { "FOO": "sandbox" },
+      }),
+    )
+    .await;
+    ids.push(created["sandboxID"].as_str().unwrap().to_string());
+  }
+
+  // Bindings do not cross sandboxes.
+  e2b_adapter_execute(&tb, &ids[0], "let secret = 'A'").await;
+  assert_eq!(
+    e2b_adapter_execute(&tb, &ids[1], "typeof secret").await["result"],
+    serde_json::json!("undefined")
+  );
+
+  // Sandbox env reaches the sandbox; the adapter's own key never does.
+  assert_eq!(
+    e2b_adapter_execute(&tb, &ids[0], "process.env.FOO").await["result"],
+    serde_json::json!("sandbox")
+  );
+  assert_eq!(
+    e2b_adapter_execute(&tb, &ids[0], "process.env.E2B_API_KEY").await
+      ["result_type"],
+    serde_json::json!("undefined")
+  );
+
+  // Network and filesystem stay unreachable through the public API. `fetch`
+  // and `Deno` are `undefined` in the vm context (the sandbox boundary shadows
+  // all non-allowlisted host globals), so calling them throws a
+  // `runtime_error`; the denied permissions and user-worker denylist are a
+  // second layer behind that.
+  let fetched =
+    e2b_adapter_execute(&tb, &ids[0], "fetch('https://example.com')").await;
+  assert_eq!(fetched["error"]["kind"], serde_json::json!("runtime_error"));
+
+  let fs =
+    e2b_adapter_execute(&tb, &ids[0], "Deno.readTextFile('/etc/passwd')").await;
+  assert_eq!(fs["error"]["kind"], serde_json::json!("runtime_error"));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_runs_sandboxes_concurrently() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let mut ids = vec![];
+  for _ in 0..2 {
+    let (_status, created) = e2b_adapter_post(
+      &tb,
+      "/sandboxes",
+      serde_json::json!({ "templateID": "base" }),
+    )
+    .await;
+    ids.push(created["sandboxID"].as_str().unwrap().to_string());
+  }
+
+  // Two sandboxes awaiting timers must overlap. This proves concurrent
+  // progress, not thread parallelism, which is not deterministic because
+  // thread assignment is not controllable.
+  let sleep_code =
+    "(async () => { await new Promise(r => setTimeout(r, 400)); return 1 })()";
+  let started = std::time::Instant::now();
+  let (a, b) = futures_util::future::join(
+    e2b_adapter_execute(&tb, &ids[0], sleep_code),
+    e2b_adapter_execute(&tb, &ids[1], sleep_code),
+  )
+  .await;
+  let elapsed = started.elapsed();
+
+  assert_eq!(a["result"], serde_json::json!(1));
+  assert_eq!(b["result"], serde_json::json!(1));
+  // Serialized execution is ~800ms for two 400ms sleeps, so this bound is the
+  // discriminator: it can only pass if the sandboxes actually overlapped.
+  assert!(
+    elapsed < Duration::from_millis(700),
+    "expected the sleeps to overlap, took {elapsed:?}"
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_separates_user_and_api_errors() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (_status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  let sandbox = created["sandboxID"].as_str().unwrap().to_string();
+
+  // User-code failures are HTTP 200 with an error body, and leave state intact.
+  e2b_adapter_execute(&tb, &sandbox, "let keep = 3").await;
+  let thrown =
+    e2b_adapter_execute(&tb, &sandbox, "throw new Error('boom')").await;
+  assert_eq!(thrown["error"]["kind"], serde_json::json!("runtime_error"));
+  assert_eq!(thrown["error"]["message"], serde_json::json!("boom"));
+  assert_eq!(
+    e2b_adapter_execute(&tb, &sandbox, "keep").await["result"],
+    serde_json::json!(3)
+  );
+
+  let compile = e2b_adapter_execute(&tb, &sandbox, "let bad: = ;;;").await;
+  assert_eq!(compile["error"]["kind"], serde_json::json!("compile_error"));
+
+  // API-level failures use the error envelope with a 4xx status.
+  for (body, expected_code) in [
+    (
+      serde_json::json!({
+        "code": "1", "context_id": sandbox, "language": "python",
+      }),
+      "unsupported_language",
+    ),
+    (
+      serde_json::json!({
+        "code": "x".repeat(300_000),
+        "context_id": sandbox,
+        "language": "javascript",
+      }),
+      "invalid_request",
+    ),
+    (
+      serde_json::json!({
+        "code": "1", "context_id": sandbox, "language": "javascript",
+        "env_vars": { "NESTED": {} },
+      }),
+      "invalid_request",
+    ),
+  ] {
+    let (status, rejected) = e2b_adapter_post(&tb, "/execute", body).await;
+    assert_eq!(status, 400, "expected 400 for {expected_code}: {rejected}");
+    assert_eq!(rejected["error_code"], serde_json::json!(expected_code));
+  }
+
+  // An unsupported template must not leak the host path of the executor.
+  let (status, template) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "nope" }),
+  )
+  .await;
+  assert_eq!(status, 400, "got: {template}");
+  assert_eq!(
+    template["error_code"],
+    serde_json::json!("unsupported_template")
+  );
+  let message = template["message"].as_str().unwrap();
+  assert!(
+    !message.contains('/'),
+    "message must not leak host paths: {message}"
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_never_revives_a_dead_sandbox() {
+  // The fixture pins a 32MB sandbox memory limit.
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-memory")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (_status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  let sandbox = created["sandboxID"].as_str().unwrap().to_string();
+
+  e2b_adapter_execute(&tb, &sandbox, "let marker = 'original'").await;
+
+  // A sandbox that already exists when the other one dies: the memory kill must
+  // take only the offending isolate, not its neighbour's state.
+  let (_status, bystander_created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  let bystander = bystander_created["sandboxID"].as_str().unwrap().to_string();
+  e2b_adapter_execute(&tb, &bystander, "let mine = 'intact'").await;
+
+  // Exhaust the sandbox's memory. Whether this returns 200 with an error or
+  // 410 depends on when the supervisor kills the isolate, so accept both.
+  let (status, _body) = e2b_adapter_post(
+    &tb,
+    "/execute",
+    serde_json::json!({
+      "code": "const a = []; while (true) { a.push(new Array(1e6).fill('x')) }",
+      "context_id": sandbox,
+      "language": "javascript",
+    }),
+  )
+  .await;
+  assert!(status == 200 || status == 410, "unexpected status {status}");
+
+  // The critical invariant: the sandbox must never come back with fresh state.
+  // A silently recreated worker would answer 200 with marker === undefined.
+  let (status, after) = e2b_adapter_post(
+    &tb,
+    "/execute",
+    serde_json::json!({
+      "code": "marker", "context_id": sandbox, "language": "javascript",
+    }),
+  )
+  .await;
+  if status == 200 {
+    assert_eq!(
+      after["result"],
+      serde_json::json!("original"),
+      "state was silently reset instead of reporting a dead sandbox: {after}"
+    );
+  } else {
+    assert_eq!(status, 410, "got: {after}");
+    assert_eq!(after["error_code"], serde_json::json!("sandbox_terminated"));
+  }
+
+  // The neighbour sandbox is untouched: only the offending isolate died.
+  let survived = e2b_adapter_execute(&tb, &bystander, "mine").await;
+  assert_eq!(survived["result"], serde_json::json!("intact"));
+
+  // The adapter itself survives a dead sandbox.
+  let (status, fresh) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(status, 201, "adapter must keep serving: {fresh}");
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_serializes_one_sandbox() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (_status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  let sandbox = created["sandboxID"].as_str().unwrap().to_string();
+
+  e2b_adapter_execute(&tb, &sandbox, "let x = 0").await;
+
+  // Assert the FINAL state, not the order of the intermediate completion
+  // values: `x++` returns the pre-increment value, so which request sees 0 and
+  // which sees 1 is not a meaningful contract.
+  let (_a, _b) = futures_util::future::join(
+    e2b_adapter_execute(&tb, &sandbox, "x++"),
+    e2b_adapter_execute(&tb, &sandbox, "x++"),
+  )
+  .await;
+
+  assert_eq!(
+    e2b_adapter_execute(&tb, &sandbox, "x").await["result"],
+    serde_json::json!(2),
+    "concurrent increments must not interleave"
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_keeps_one_sandbox_ordered_under_timeout() {
+  // Short lock-wait deadline; the global slot stays generous so requests
+  // contend on the per-sandbox lock rather than on the slot.
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-lock")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {created}");
+  let sandbox = created["sandboxID"].as_str().unwrap().to_string();
+
+  // The first execution holds the lock for ~400ms; the other two cannot get it
+  // within the 50ms deadline. A waiter that resolved its OWN tail on timeout
+  // would hand the lock to the third request while the first was still running,
+  // producing two successes instead of one.
+  let slow =
+    "(async () => { await new Promise(r => setTimeout(r, 400)); return 'A' })()";
+  let responses = futures_util::future::join_all(vec![
+    e2b_adapter_post(
+      &tb,
+      "/execute",
+      serde_json::json!({
+        "code": slow, "context_id": sandbox, "language": "javascript",
+      }),
+    ),
+    e2b_adapter_post(
+      &tb,
+      "/execute",
+      serde_json::json!({
+        "code": "1", "context_id": sandbox, "language": "javascript",
+      }),
+    ),
+    e2b_adapter_post(
+      &tb,
+      "/execute",
+      serde_json::json!({
+        "code": "1", "context_id": sandbox, "language": "javascript",
+      }),
+    ),
+  ])
+  .await;
+
+  let succeeded = responses
+    .iter()
+    .filter(|(status, _)| *status == 200)
+    .count();
+  let refused = responses
+    .iter()
+    .filter(|(status, body)| {
+      *status == 429
+        && body["error_code"] == serde_json::json!("too_many_requests")
+    })
+    .count();
+
+  assert_eq!(
+    succeeded, 1,
+    "only the lock holder may run; got {succeeded} successes: {responses:?}"
+  );
+  assert_eq!(refused, 2, "got: {responses:?}");
+
+  // The sandbox is still usable once the queue drains.
+  assert_eq!(
+    e2b_adapter_execute(&tb, &sandbox, "1 + 1").await["result"],
+    serde_json::json!(2)
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_rejects_when_queue_is_full() {
+  // The fixture allows one concurrent execution with a 50ms queue deadline.
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-queue")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let mut sandboxes = vec![];
+  // Two is enough: the fixture allows one concurrent execution, so the second
+  // request must be refused. Each extra sandbox costs a worker boot, which
+  // dominates this test's runtime in debug builds.
+  for _ in 0..2 {
+    let (status, created) = e2b_adapter_post(
+      &tb,
+      "/sandboxes",
+      serde_json::json!({ "templateID": "base" }),
+    )
+    .await;
+    assert_eq!(status, 201, "got: {created}");
+    sandboxes.push(created["sandboxID"].as_str().unwrap().to_string());
+  }
+
+  // Different sandboxes do not contend on the per-sandbox lock, so these
+  // contend only on the global slot. Each holds it for ~400ms.
+  let slow = "(async () => { await new Promise(r => setTimeout(r, 400)); \
+              return 1 })()";
+  let requests = sandboxes.iter().map(|sandbox| {
+    e2b_adapter_post(
+      &tb,
+      "/execute",
+      serde_json::json!({
+        "code": slow,
+        "context_id": sandbox,
+        "language": "javascript",
+      }),
+    )
+  });
+  let responses = futures_util::future::join_all(requests).await;
+
+  let rejected = responses
+    .iter()
+    .filter(|(status, body)| {
+      *status == 429
+        && body["error_code"] == serde_json::json!("too_many_requests")
+    })
+    .count();
+  assert!(
+    rejected >= 1,
+    "expected at least one 429 from the global cap, got: {responses:?}"
+  );
+
+  // The adapter stays usable once the queue drains.
+  assert_eq!(
+    e2b_adapter_execute(&tb, &sandboxes[0], "1 + 1").await["result"],
+    serde_json::json!(2)
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_transfers_a_raced_slot_to_the_next_waiter() {
+  // The fixture drives the queue lost-wakeup interleave with a hand-driven
+  // clock: a queued waiter is admitted by release() in the same turn its own
+  // deadline fires, then times out. With the bug the slot it was handed is
+  // stranded and the next waiter never runs though capacity is free. The
+  // fixture reports whether that next waiter ran.
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-queue-race")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, body) = e2b_adapter_get(&tb, "/race").await;
+  assert_eq!(status, 200, "got: {body}");
+  assert_eq!(
+    body["secondWaiterRan"],
+    serde_json::json!(true),
+    "a timed-out-but-admitted waiter stranded its slot: {body}"
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_revalidates_after_waiting_for_global_slot() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-stale-slot")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, holder) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({
+      "templateID": "base",
+      "envVars": { "__role": "holder" },
+    }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {holder}");
+  let holder_id = holder["sandboxID"].as_str().unwrap().to_string();
+
+  let (status, queued) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({
+      "templateID": "base",
+      "envVars": { "__role": "queued" },
+    }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {queued}");
+  let queued_id = queued["sandboxID"].as_str().unwrap().to_string();
+
+  let holder_request = e2b_adapter_post(
+    &tb,
+    "/execute",
+    serde_json::json!({
+      "code": "hold",
+      "context_id": holder_id,
+      "language": "javascript",
+    }),
+  );
+  let race = async {
+    timeout(Duration::from_secs(5), async {
+      loop {
+        let (status, body) =
+          e2b_adapter_get(&tb, "/__test/holder-started").await;
+        assert_eq!(status, 200, "got: {body}");
+        if body["holderStarted"] == serde_json::json!(true) {
+          break;
+        }
+        sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .expect("holder never occupied the global execution slot");
+
+    let queued_request = e2b_adapter_post(
+      &tb,
+      "/execute",
+      serde_json::json!({
+        "code": "must not run",
+        "context_id": queued_id,
+        "language": "javascript",
+      }),
+    );
+    tokio::pin!(queued_request);
+
+    timeout(Duration::from_secs(5), async {
+      let pending_path = format!("/__test/lock-pending?sandbox={queued_id}");
+      loop {
+        let pending_check = e2b_adapter_get(&tb, &pending_path);
+        tokio::select! {
+          response = &mut queued_request => {
+            panic!("queued execution finished before deletion: {response:?}");
+          }
+          (status, body) = pending_check => {
+            assert_eq!(status, 200, "got: {body}");
+            if body["pending"] == serde_json::json!(true) {
+              break;
+            }
+          }
+        }
+        sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .expect("second execution never queued for the global slot");
+
+    assert_eq!(
+      e2b_adapter_delete(&tb, &format!("/sandboxes/{queued_id}")).await,
+      204
+    );
+
+    let (status, body) = timeout(Duration::from_secs(5), &mut queued_request)
+      .await
+      .expect("queued execution did not finish after the slot was released");
+    assert_eq!(status, 410, "stale execution was dispatched: {body}");
+    assert_eq!(body["error_code"], serde_json::json!("sandbox_terminated"));
+
+    let (status, counts) =
+      e2b_adapter_get(&tb, "/__test/execution-count?role=queued").await;
+    assert_eq!(status, 200, "got: {counts}");
+    assert_eq!(
+      counts["count"],
+      serde_json::json!(0),
+      "deleted sandbox code reached its executor: {counts}"
+    );
+  };
+
+  let (holder_response, ()) =
+    futures_util::future::join(holder_request, race).await;
+  assert_eq!(holder_response.0, 200, "got: {:?}", holder_response.1);
+
+  assert_eq!(
+    e2b_adapter_execute(&tb, &holder_id, "after stale waiter").await["result"],
+    serde_json::json!(1),
+    "the stale path leaked its acquired global slot"
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_refuses_execution_when_ttl_lapses_while_waiting() {
+  // Default limits: the lock wait is generous (30s), so a queued execute waits
+  // through the holder rather than timing out on the lock.
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  // A 0.6s TTL: long enough for both executes to pass the top-of-handler
+  // resolve, short enough to lapse while the second waits on the lock.
+  let (status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base", "timeout": 0.6 }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {created}");
+  let sandbox = created["sandboxID"].as_str().unwrap().to_string();
+
+  // The holder pins the per-sandbox lock for ~2s, well past the TTL. The waiter
+  // starts a little later so the holder takes the lock first; the waiter
+  // resolves the still-live record, then blocks on the lock. By the time it
+  // acquires the lock the TTL has lapsed, so executing then would run stale
+  // code on an expired sandbox.
+  let hold = "(async () => { await new Promise(r => setTimeout(r, 2000)); \
+              return 'A' })()";
+  let holder = e2b_adapter_post(
+    &tb,
+    "/execute",
+    serde_json::json!({
+      "code": hold, "context_id": sandbox, "language": "javascript",
+    }),
+  );
+  let waiter = async {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    e2b_adapter_post(
+      &tb,
+      "/execute",
+      serde_json::json!({
+        "code": "1 + 1", "context_id": sandbox, "language": "javascript",
+      }),
+    )
+    .await
+  };
+  let (holder, waiter) = futures_util::future::join(holder, waiter).await;
+
+  assert_eq!(holder.0, 200, "holder ran before expiry: {:?}", holder.1);
+  assert_eq!(
+    waiter.0, 404,
+    "executed on an expired sandbox instead of refusing: {:?}",
+    waiter.1
+  );
+  assert_eq!(
+    waiter.1["error_code"],
+    serde_json::json!("sandbox_expired"),
+    "got: {:?}",
+    waiter.1
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_sandbox_lifecycle() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (_status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base", "metadata": { "user": "t" } }),
+  )
+  .await;
+  let sandbox = created["sandboxID"].as_str().unwrap().to_string();
+
+  let (status, fetched) =
+    e2b_adapter_get(&tb, &format!("/sandboxes/{sandbox}")).await;
+  assert_eq!(status, 200, "got: {fetched}");
+  assert_eq!(fetched["sandboxID"], serde_json::json!(sandbox));
+  assert_eq!(fetched["metadata"]["user"], serde_json::json!("t"));
+
+  for path in ["/sandboxes", "/v2/sandboxes"] {
+    let (status, listed) = e2b_adapter_get(&tb, path).await;
+    assert_eq!(status, 200, "{path} got: {listed}");
+    let items = listed.as_array().expect("array");
+    assert!(
+      items
+        .iter()
+        .any(|item| item["sandboxID"] == serde_json::json!(sandbox)),
+      "{path} did not list the sandbox: {listed}"
+    );
+  }
+
+  // Extending within the wall-clock ceiling is allowed.
+  let (status, _body) = e2b_adapter_post(
+    &tb,
+    &format!("/sandboxes/{sandbox}/timeout"),
+    serde_json::json!({ "timeout": 600 }),
+  )
+  .await;
+  assert_eq!(status, 204);
+
+  // Beyond the ceiling must be refused, not silently granted: the worker wall
+  // clock starts at boot and cannot be extended.
+  let (status, refused) = e2b_adapter_post(
+    &tb,
+    &format!("/sandboxes/{sandbox}/timeout"),
+    serde_json::json!({ "timeout": 99_999_999 }),
+  )
+  .await;
+  assert_eq!(status, 400, "got: {refused}");
+  assert_eq!(refused["error_code"], serde_json::json!("invalid_request"));
+
+  // Delete releases the worker, and the id is remembered as terminated.
+  assert_eq!(
+    e2b_adapter_delete(&tb, &format!("/sandboxes/{sandbox}")).await,
+    204
+  );
+
+  let (status, gone) =
+    e2b_adapter_get(&tb, &format!("/sandboxes/{sandbox}")).await;
+  assert_eq!(status, 410, "got: {gone}");
+  assert_eq!(gone["error_code"], serde_json::json!("sandbox_terminated"));
+
+  let (status, after) = e2b_adapter_post(
+    &tb,
+    "/execute",
+    serde_json::json!({
+      "code": "1", "context_id": sandbox, "language": "javascript",
+    }),
+  )
+  .await;
+  assert_eq!(status, 410, "execute after delete: {after}");
+
+  // An id we never issued is not found, rather than terminated.
+  let (status, unknown) =
+    e2b_adapter_get(&tb, "/sandboxes/never-existed").await;
+  assert_eq!(status, 404, "got: {unknown}");
+  assert_eq!(
+    unknown["error_code"],
+    serde_json::json!("sandbox_not_found")
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_expires_sandboxes() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (_status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base", "timeout": 1 }),
+  )
+  .await;
+  let sandbox = created["sandboxID"].as_str().unwrap().to_string();
+
+  assert_eq!(
+    e2b_adapter_execute(&tb, &sandbox, "1 + 1").await["result"],
+    serde_json::json!(2)
+  );
+
+  sleep(Duration::from_millis(1500)).await;
+
+  // Expiry must be distinguishable from an explicit delete, even though both
+  // reap the worker.
+  let (status, expired) =
+    e2b_adapter_get(&tb, &format!("/sandboxes/{sandbox}")).await;
+  assert_eq!(status, 404, "got: {expired}");
+  assert_eq!(expired["error_code"], serde_json::json!("sandbox_expired"));
+
+  let (status, executed) = e2b_adapter_post(
+    &tb,
+    "/execute",
+    serde_json::json!({
+      "code": "1", "context_id": sandbox, "language": "javascript",
+    }),
+  )
+  .await;
+  assert_eq!(status, 404, "execute on expired: {executed}");
+
+  let (_status, listed) = e2b_adapter_get(&tb, "/sandboxes").await;
+  assert_eq!(
+    listed.as_array().unwrap().len(),
+    0,
+    "expired sandbox must not be listed: {listed}"
+  );
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_sweeps_expired_sandboxes_concurrently() {
+  // The fixture's fake workers take ~700ms each to terminate. A sweep that
+  // reaps expired sandboxes one at a time would serialize those terminations
+  // (~N * 700ms) while the caller waits; reaping them concurrently bounds the
+  // wait near a single terminate. A live sandbox is mixed in to prove sweep
+  // never terminates a record whose TTL has not lapsed.
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-slow-terminate")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, live) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base", "timeout": 600 }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {live}");
+  let live_id = live["sandboxID"].as_str().unwrap().to_string();
+
+  let mut expired_ids = vec![];
+  for _ in 0..5 {
+    let (status, created) = e2b_adapter_post(
+      &tb,
+      "/sandboxes",
+      serde_json::json!({ "templateID": "base", "timeout": 1 }),
+    )
+    .await;
+    assert_eq!(status, 201, "got: {created}");
+    expired_ids.push(created["sandboxID"].as_str().unwrap().to_string());
+  }
+
+  // Let the short-TTL sandboxes lapse before triggering a sweep.
+  sleep(Duration::from_millis(1200)).await;
+
+  // A single sweep-triggering request. Sequential reaping would take ~3.5s;
+  // concurrent reaping stays near one 700ms terminate.
+  let started = std::time::Instant::now();
+  let (status, listed) = e2b_adapter_get(&tb, "/sandboxes").await;
+  let elapsed = started.elapsed();
+  assert_eq!(status, 200, "got: {listed}");
+  assert!(
+    elapsed < Duration::from_secs(2),
+    "sweep serialized expired terminations; took {elapsed:?}"
+  );
+
+  // Only the live sandbox lists; no expired one is ever shown as running.
+  let items = listed.as_array().unwrap();
+  assert_eq!(
+    items.len(),
+    1,
+    "only the live sandbox should list: {listed}"
+  );
+  assert_eq!(items[0]["sandboxID"], serde_json::json!(live_id));
+
+  // Every expired id reports sandbox_expired, never sandbox_terminated.
+  for id in &expired_ids {
+    let (status, body) =
+      e2b_adapter_get(&tb, &format!("/sandboxes/{id}")).await;
+    assert_eq!(status, 404, "got: {body}");
+    assert_eq!(body["error_code"], serde_json::json!("sandbox_expired"));
+  }
+
+  // The live sandbox was not reaped by the sweep.
+  let (status, body) =
+    e2b_adapter_get(&tb, &format!("/sandboxes/{live_id}")).await;
+  assert_eq!(status, 200, "live sandbox was swept: {body}");
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_requires_api_key() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let unauthenticated =
+    |path: &'static str, method: &'static str, key: Option<&'static str>| {
+      tb.request(move |b| {
+        let mut builder = b
+          .uri(path)
+          .method(method)
+          .header("content-type", "application/json");
+        if let Some(key) = key {
+          builder = builder.header("x-api-key", key);
+        }
+        builder
+          .body(Body::from(r#"{"templateID":"base"}"#))
+          .context("can't make request")
+      })
+    };
+
+  for (path, method, key) in [
+    ("/sandboxes", "POST", None),
+    ("/sandboxes", "POST", Some("wrong")),
+    ("/execute", "POST", None),
+    ("/internal/metrics", "GET", None),
+    // The gate runs before routing, so even an unknown path must not leak
+    // whether it exists.
+    ("/nope", "GET", None),
+  ] {
+    let mut resp = unauthenticated(path, method, key).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 401, "{method} {path} was not gated");
+    let bytes = to_bytes(resp.body_mut()).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error_code"], serde_json::json!("unauthorized"));
+  }
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_caps_concurrent_sandbox_creates() {
+  // The fixture pins maxConcurrentSandboxes to 2.
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-cap")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  // Reading the size and inserting after an await would let every one of these
+  // pass the check, overshooting the cap by up to N-1 isolates. Force-created
+  // workers bypass the pool's own semaphore, so this counter is the only bound.
+  let creates = (0..5).map(|_| {
+    e2b_adapter_post(
+      &tb,
+      "/sandboxes",
+      serde_json::json!({ "templateID": "base" }),
+    )
+  });
+  let responses = futures_util::future::join_all(creates).await;
+
+  let created = responses
+    .iter()
+    .filter(|(status, _)| *status == 201)
+    .count();
+  let rejected = responses
+    .iter()
+    .filter(|(status, body)| {
+      *status == 429
+        && body["error_code"] == serde_json::json!("too_many_sandboxes")
+    })
+    .count();
+
+  assert!(
+    created <= 2,
+    "cap exceeded: {created} created, {responses:?}"
+  );
+  assert_eq!(created + rejected, 5, "unexpected outcomes: {responses:?}");
+  assert!(created >= 1, "nothing was created: {responses:?}");
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_create_gate_is_fifo_and_reports_waiters() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-create-gate")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  {
+    let first = e2b_adapter_post(
+      &tb,
+      "/sandboxes",
+      serde_json::json!({
+        "templateID": "base",
+        "envVars": { "__role": "hold" },
+      }),
+    );
+    tokio::pin!(first);
+
+    timeout(Duration::from_secs(5), async {
+    loop {
+      let state = e2b_adapter_get(&tb, "/__test/create-gate-state");
+      tokio::select! {
+        response = &mut first => panic!("first create completed before release: {response:?}"),
+        (status, body) = state => {
+          assert_eq!(status, 200, "got: {body}");
+          if body["firstInitStarted"] == serde_json::json!(true) {
+            break;
+          }
+        }
+      }
+      sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("first create never reached its controlled worker boot");
+
+    let second = e2b_adapter_post(
+      &tb,
+      "/sandboxes",
+      serde_json::json!({
+        "templateID": "base",
+        "envVars": { "__role": "second-hold" },
+      }),
+    );
+    tokio::pin!(second);
+
+    timeout(Duration::from_secs(5), async {
+      loop {
+        let metrics = e2b_adapter_get(&tb, "/internal/metrics");
+        tokio::select! {
+          response = &mut second => panic!("second create bypassed the gate: {response:?}"),
+          (status, body) = metrics => {
+            assert_eq!(status, 200, "got: {body}");
+            if body["creationGate"]["active"] == serde_json::json!(1)
+              && body["creationGate"]["waiting"] == serde_json::json!(1) {
+              break;
+            }
+          }
+        }
+        sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .expect("second creator never queued at the create gate");
+
+    let third = e2b_adapter_post(
+      &tb,
+      "/sandboxes",
+      serde_json::json!({
+        "templateID": "base",
+        "envVars": { "__role": "third" },
+      }),
+    );
+    tokio::pin!(third);
+
+    timeout(Duration::from_secs(5), async {
+      loop {
+        let metrics = e2b_adapter_get(&tb, "/internal/metrics");
+        tokio::select! {
+          response = &mut second => panic!("second create bypassed the gate: {response:?}"),
+          response = &mut third => panic!("third create bypassed the gate: {response:?}"),
+          (status, body) = metrics => {
+            assert_eq!(status, 200, "got: {body}");
+            if body["creationGate"]["active"] == serde_json::json!(1)
+              && body["creationGate"]["waiting"] == serde_json::json!(2) {
+              break;
+            }
+          }
+        }
+        sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .expect("third creator never queued at the create gate");
+
+    let (status, body) =
+      e2b_adapter_get(&tb, "/__test/release-create-gate").await;
+    assert_eq!(status, 204, "got: {body}");
+
+    timeout(Duration::from_secs(5), async {
+      loop {
+        let state = e2b_adapter_get(&tb, "/__test/create-gate-state");
+        tokio::select! {
+          response = &mut third => panic!("third create bypassed the second FIFO waiter: {response:?}"),
+          (status, body) = state => {
+            assert_eq!(status, 200, "got: {body}");
+            if body["secondInitStarted"] == serde_json::json!(true) {
+              assert_eq!(
+                body["initOrder"],
+                serde_json::json!(["hold", "second-hold"]),
+                "unexpected create admission order: {body}",
+              );
+              break;
+            }
+          }
+        }
+        sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .expect("second queued creator was not admitted first");
+
+    let (status, metrics) = e2b_adapter_get(&tb, "/internal/metrics").await;
+    assert_eq!(status, 200, "got: {metrics}");
+    assert_eq!(metrics["creationGate"]["active"], serde_json::json!(1));
+    assert_eq!(metrics["creationGate"]["waiting"], serde_json::json!(1));
+
+    let (status, body) =
+      e2b_adapter_get(&tb, "/__test/release-second-create-gate").await;
+    assert_eq!(status, 204, "got: {body}");
+    let (first_response, second_response, third_response) =
+      futures_util::future::join3(&mut first, &mut second, &mut third).await;
+    assert_eq!(first_response.0, 201, "got: {:?}", first_response.1);
+    assert_eq!(second_response.0, 201, "got: {:?}", second_response.1);
+    assert_eq!(third_response.0, 201, "got: {:?}", third_response.1);
+
+    let (status, state) =
+      e2b_adapter_get(&tb, "/__test/create-gate-state").await;
+    assert_eq!(status, 200, "got: {state}");
+    assert_eq!(
+      state["initOrder"],
+      serde_json::json!(["hold", "second-hold", "third"]),
+      "unexpected create admission order: {state}",
+    );
+
+    let (status, metrics) = e2b_adapter_get(&tb, "/internal/metrics").await;
+    assert_eq!(status, 200, "got: {metrics}");
+    assert_eq!(metrics["creationGate"]["active"], serde_json::json!(0));
+    assert_eq!(metrics["creationGate"]["waiting"], serde_json::json!(0));
+    assert!(
+      metrics["rollingLifecycleWindow"]["stages"]["create_total"]["ok"]
+        ["count"]
+        .as_u64()
+        .unwrap()
+        >= 3
+    );
+    for stage in [
+      "loader_vfs",
+      "resource_limits",
+      "js_runtime_new",
+      "bootstrap",
+      "bootstrap_blocking_run",
+      "bootstrap_blocking_queue",
+      "post_setup_blocking_run",
+      "post_setup_blocking_queue",
+    ] {
+      assert_eq!(
+        metrics["rollingLifecycleWindow"]["stages"][stage]["ok"]["count"],
+        serde_json::json!(3),
+        "missing {stage} timing: {metrics}"
+      );
+    }
+    for (stage, sum_ms) in [
+      ("bootstrap_blocking_run", 18),
+      ("bootstrap_blocking_queue", 21),
+      ("post_setup_blocking_run", 24),
+      ("post_setup_blocking_queue", 27),
+    ] {
+      assert_eq!(
+        metrics["rollingLifecycleWindow"]["stages"][stage]["ok"]["sumMs"],
+        serde_json::json!(sum_ms),
+        "wrong {stage} timing: {metrics}"
+      );
+    }
+  }
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_create_gate_timeout_releases_reservation() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-create-gate")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  {
+    let first = e2b_adapter_post(
+      &tb,
+      "/sandboxes",
+      serde_json::json!({
+        "templateID": "base",
+        "envVars": { "__role": "hold" },
+      }),
+    );
+    tokio::pin!(first);
+
+    timeout(Duration::from_secs(5), async {
+    loop {
+      let state = e2b_adapter_get(&tb, "/__test/create-gate-state");
+      tokio::select! {
+        response = &mut first => panic!("first create completed before release: {response:?}"),
+        (status, body) = state => {
+          assert_eq!(status, 200, "got: {body}");
+          if body["firstInitStarted"] == serde_json::json!(true) {
+            break;
+          }
+        }
+      }
+      sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("first create never reached its controlled worker boot");
+
+    let (status, body) =
+      e2b_adapter_get(&tb, "/__test/shorten-create-gate-timeout").await;
+    assert_eq!(status, 204, "got: {body}");
+
+    let (status, timed_out) = timeout(
+      Duration::from_secs(5),
+      e2b_adapter_post(
+        &tb,
+        "/sandboxes",
+        serde_json::json!({ "templateID": "base" }),
+      ),
+    )
+    .await
+    .expect("queued create did not time out");
+    assert_eq!(status, 429, "got: {timed_out}");
+    assert_eq!(
+      timed_out["error_code"],
+      serde_json::json!("too_many_requests"),
+      "got: {timed_out}",
+    );
+
+    let (status, metrics) = e2b_adapter_get(&tb, "/internal/metrics").await;
+    assert_eq!(status, 200, "got: {metrics}");
+    assert_eq!(metrics["creationGate"]["active"], serde_json::json!(1));
+    assert_eq!(metrics["creationGate"]["waiting"], serde_json::json!(0));
+    assert_eq!(metrics["capacity"]["reserved"], serde_json::json!(1));
+
+    let (status, body) =
+      e2b_adapter_get(&tb, "/__test/release-create-gate").await;
+    assert_eq!(status, 204, "got: {body}");
+    let first_response = first.await;
+    assert_eq!(first_response.0, 201, "got: {:?}", first_response.1);
+
+    let (status, state) =
+      e2b_adapter_get(&tb, "/__test/create-gate-state").await;
+    assert_eq!(status, 200, "got: {state}");
+    assert_eq!(
+      state["initOrder"],
+      serde_json::json!(["hold"]),
+      "timed-out create started after its slot was released: {state}",
+    );
+  }
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_keeps_deleted_workers_draining_until_final_shutdown()
+{
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-draining")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {created}");
+  let sandbox = created["sandboxID"].as_str().unwrap();
+
+  let started = std::time::Instant::now();
+  assert_eq!(
+    e2b_adapter_delete(&tb, &format!("/sandboxes/{sandbox}")).await,
+    204,
+  );
+  assert!(
+    started.elapsed() < Duration::from_secs(1),
+    "DELETE waited for final shutdown"
+  );
+
+  let (status, metrics) = e2b_adapter_get(&tb, "/internal/metrics").await;
+  assert_eq!(status, 200, "got: {metrics}");
+  assert_eq!(metrics["capacity"]["active"], serde_json::json!(0));
+  assert_eq!(metrics["capacity"]["reserved"], serde_json::json!(0));
+  assert_eq!(metrics["capacity"]["draining"], serde_json::json!(1));
+
+  let (status, refused) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(status, 429, "got: {refused}");
+  assert_eq!(
+    refused["error_code"],
+    serde_json::json!("too_many_sandboxes")
+  );
+
+  let (status, body) =
+    e2b_adapter_get(&tb, "/__test/release-final-shutdown").await;
+  assert_eq!(status, 204, "got: {body}");
+  let metrics = timeout(Duration::from_secs(5), async {
+    loop {
+      let (status, metrics) = e2b_adapter_get(&tb, "/internal/metrics").await;
+      assert_eq!(status, 200, "got: {metrics}");
+      if metrics["capacity"]["draining"] == serde_json::json!(0) {
+        return metrics;
+      }
+      sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("draining capacity was not released after final shutdown");
+
+  assert_eq!(
+    metrics["lifetimeFinalWorkerTotals"]["cpuTimeUsed"],
+    serde_json::json!(7)
+  );
+  assert_eq!(
+    metrics["lifetimeFinalWorkerTotals"]["v8Heap"]["heap"],
+    serde_json::json!(20)
+  );
+  assert!(metrics.get("sandboxID").is_none());
+  assert!(metrics.get("workerID").is_none());
+
+  let (status, replacement) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {replacement}");
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_defers_executor_failure_until_execute() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-init-draining")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {created}");
+  let sandbox = created["sandboxID"].as_str().expect("sandboxID");
+
+  let (status, failed) = e2b_adapter_post(
+    &tb,
+    "/execute",
+    serde_json::json!({
+      "code": "1 + 2",
+      "context_id": sandbox,
+      "language": "javascript",
+    }),
+  )
+  .await;
+  assert_eq!(status, 500, "got: {failed}");
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_e2b_adapter_executes_statefully() {
+  let tb = TestBedBuilder::new("./test_cases/e2b-adapter-main")
+    .with_per_worker_policy(None)
+    .build()
+    .await;
+
+  let (status, created) = e2b_adapter_post(
+    &tb,
+    "/sandboxes",
+    serde_json::json!({ "templateID": "base" }),
+  )
+  .await;
+  assert_eq!(status, 201, "got: {created}");
+  let sandbox = created["sandboxID"]
+    .as_str()
+    .expect("sandboxID")
+    .to_string();
+
+  e2b_adapter_execute(&tb, &sandbox, "let x = 1").await;
+  e2b_adapter_execute(&tb, &sandbox, "x++").await;
+  let third = e2b_adapter_execute(&tb, &sandbox, "x").await;
+  assert_eq!(third["result"], serde_json::json!(2));
+  assert_eq!(third["context_id"], serde_json::json!(sandbox));
+
+  tb.exit(Duration::from_secs(TESTBED_DEADLINE_SEC)).await;
+}
+
 static OTEL_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 fn init_otel() {

@@ -1,0 +1,447 @@
+openapi: 3.0.3
+info:
+  title: Edge Runtime E2B Adapter
+  version: 0.1.0
+  description: |
+    An E2B-compatible **subset**. The sandbox routes mirror E2B's shapes;
+    `/execute` is a custom extension and is not part of E2B's API. The local
+    Jupyter route supports the official Code Interpreter SDK when its
+    `_jupyter_url` is overridden, but production wildcard-host DNS/TLS routing
+    is not implemented. This is not a drop-in E2B deployment.
+
+    Sandboxes execute JavaScript and TypeScript only. Python is not supported:
+    `language: "python"` returns `unsupported_language`.
+
+    Response conventions:
+      * Custom `/execute` user-code failures return **HTTP 200** with an
+        `ExecutionError` in the `error` field.
+      * Jupyter user-code failures return **HTTP 200** error events in NDJSON.
+      * API-level failures return **4xx/5xx** with the `Error` envelope.
+
+    User-code failures leave the sandbox usable.
+
+servers:
+  - url: http://localhost:9998
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /sandboxes:
+    post:
+      summary: Create a sandbox
+      description: |
+        Creates one sandbox backed by a dedicated executor worker holding a
+        persistent JavaScript context. Returns 201 after the worker loads its
+        module graph; executor startup failures can first surface on execution.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                templateID:
+                  type: string
+                  enum: [base, edge-runtime, code-interpreter-v1]
+                  default: base
+                timeout:
+                  type: number
+                  description: TTL in seconds. Clamped to the wall-clock ceiling.
+                  default: 300
+                envVars:
+                  type: object
+                  additionalProperties: { type: string }
+                metadata:
+                  type: object
+                  additionalProperties: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SandboxCreate' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429':
+          description: Sandbox limit reached (`too_many_sandboxes`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    get:
+      summary: List running sandboxes
+      description: Expired sandboxes are reaped before listing and never appear.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 100 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Sandbox' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v2/sandboxes:
+    get:
+      summary: List running sandboxes (v2 alias)
+      description: Identical to `GET /sandboxes`.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 100 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Sandbox' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /sandboxes/{sandboxID}:
+    parameters:
+      - name: sandboxID
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      summary: Get a sandbox
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sandbox' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Missing' }
+        '410': { $ref: '#/components/responses/Gone' }
+    delete:
+      summary: Delete a sandbox
+      description: |
+        Terminates the executor isolate, not just the registry record. The id is
+        remembered, so later calls report `sandbox_terminated` rather than
+        `sandbox_not_found`.
+      responses:
+        '204': { description: Deleted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Missing' }
+        '410': { $ref: '#/components/responses/Gone' }
+
+  /sandboxes/{sandboxID}/timeout:
+    parameters:
+      - name: sandboxID
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      summary: Extend a sandbox TTL
+      description: |
+        Sets `expiresAt = now + timeout`. A value beyond the sandbox's
+        wall-clock ceiling is refused with 400 rather than granted, because the
+        underlying worker wall clock starts at boot and cannot be extended.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [timeout]
+              properties:
+                timeout:
+                  type: number
+                  description: Seconds from now. Must be positive.
+      responses:
+        '204': { description: Updated }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Missing' }
+        '410': { $ref: '#/components/responses/Gone' }
+
+  /sandboxes/{sandboxID}/jupyter/execute:
+    parameters:
+      - name: sandboxID
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      summary: Execute code through the E2B Jupyter protocol
+      description: |
+        Runs a JavaScript or TypeScript snippet in the sandbox's persistent
+        context. Omitted or null `language` means JavaScript in this adapter,
+        unlike the official E2B Code Interpreter service's Python default.
+        Non-null `context_id` values are not supported.
+      security:
+        - SandboxTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+                context_id:
+                  type: string
+                  nullable: true
+                  description: Must be omitted or null.
+                language:
+                  type: string
+                  nullable: true
+                  enum: [javascript, typescript]
+                  description: Omitted or null means JavaScript.
+                env_vars:
+                  type: object
+                  nullable: true
+                  additionalProperties: { type: string }
+      responses:
+        '200':
+          description: |
+            A stream of newline-delimited JSON events. Each non-empty line is
+            one stdout, stderr, result, or error event; the body is not a JSON
+            array. User-code failures are reported as error events with HTTP 200.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+                description: Line-delimited Jupyter events.
+              x-ndjson-event-schema:
+                oneOf:
+                  - $ref: '#/components/schemas/JupyterStdoutEvent'
+                  - $ref: '#/components/schemas/JupyterStderrEvent'
+                  - $ref: '#/components/schemas/JupyterResultEvent'
+                  - $ref: '#/components/schemas/JupyterErrorEvent'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Missing' }
+        '429':
+          description: Execution slot unavailable (`too_many_requests`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /execute:
+    post:
+      summary: Execute code in a sandbox (custom extension)
+      description: |
+        Runs a snippet in the sandbox's persistent context, so bindings survive
+        across calls. Executions for one sandbox are serialized.
+
+        Not supported: `import`, `require`, dynamic `import()`, and top-level
+        `await` — each reports `compile_error`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, context_id, language]
+              properties:
+                code: { type: string }
+                context_id:
+                  type: string
+                  description: The sandboxID. One sandbox is one context.
+                language:
+                  type: string
+                  enum: [javascript, typescript]
+                env_vars:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: Applies to this execution only.
+      responses:
+        '200':
+          description: |
+            Executed. A user-code failure is also 200, reported in `error`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Execution' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Missing' }
+        '410': { $ref: '#/components/responses/Gone' }
+        '429':
+          description: Execution slot unavailable (`too_many_requests`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    SandboxTokenAuth:
+      type: apiKey
+      in: header
+      name: X-Access-Token
+
+  responses:
+    BadRequest:
+      description: '`invalid_request`, `unsupported_template`, or `unsupported_language`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: '`unauthorized`. Also returned for unknown paths.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Missing:
+      description: '`sandbox_not_found` or `sandbox_expired`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Gone:
+      description: '`sandbox_terminated`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServerError:
+      description: '`internal_server_error`. Detail is logged, not returned.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Sandbox:
+      type: object
+      required: [sandboxID, templateID, clientID, envdVersion, startedAt]
+      properties:
+        sandboxID: { type: string }
+        templateID: { type: string }
+        clientID: { type: string, example: edge-runtime-adapter }
+        # The official SDK parses this with PEP 440 and refuses anything below
+        # 0.1.0, so it cannot be a descriptive string.
+        envdVersion: { type: string, example: 0.1.0 }
+        startedAt: { type: string, format: date-time }
+        endAt: { type: string, format: date-time }
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+        # Required by the official SDK's sandbox models. A sandbox has no
+        # dedicated core and no writable disk, and is only ever listed running.
+        cpuCount: { type: integer, example: 1 }
+        memoryMB: { type: integer, example: 128 }
+        diskSizeMB: { type: integer, example: 0 }
+        state: { type: string, enum: [running] }
+
+    SandboxCreate:
+      allOf:
+        - $ref: '#/components/schemas/Sandbox'
+        - type: object
+          required: [envdAccessToken]
+          properties:
+            envdAccessToken:
+              type: string
+              description: |
+                Per-sandbox token for X-Access-Token. Returned only at creation
+                and never by GET or list operations.
+
+    JupyterStdoutEvent:
+      type: object
+      required: [type, text, timestamp]
+      properties:
+        type: { type: string, enum: [stdout] }
+        text: { type: string }
+        timestamp:
+          type: number
+          description: Timestamp in nanoseconds since the Unix epoch.
+
+    JupyterStderrEvent:
+      type: object
+      required: [type, text, timestamp]
+      properties:
+        type: { type: string, enum: [stderr] }
+        text: { type: string }
+        timestamp:
+          type: number
+          description: Timestamp in nanoseconds since the Unix epoch.
+
+    JupyterResultEvent:
+      type: object
+      required: [type, text, is_main_result]
+      properties:
+        type: { type: string, enum: [result] }
+        text: { type: string }
+        json:
+          nullable: true
+          description: Present only when the completion value is JSON-safe.
+        is_main_result: { type: boolean, enum: [true] }
+
+    JupyterErrorEvent:
+      type: object
+      required: [type, name, value, traceback]
+      properties:
+        type: { type: string, enum: [error] }
+        name: { type: string }
+        value: { type: string }
+        traceback: { type: string }
+
+    Execution:
+      type: object
+      required: [execution_id, context_id, language, result, result_type, error]
+      properties:
+        execution_id: { type: string }
+        context_id: { type: string }
+        language: { type: string }
+        result:
+          nullable: true
+          description: |
+            The completion value when it is JSON-safe. Values that are not —
+            BigInt, functions, symbols, errors, Map, Set, cycles — are null
+            with the kind in `result_type` and a rendering in `result_repr`.
+        result_type: { type: string, example: number }
+        result_repr: { type: string, nullable: true, example: 123n }
+        stdout:
+          type: array
+          items: { type: string }
+        stderr:
+          type: array
+          items: { type: string }
+        error:
+          nullable: true
+          allOf: [{ $ref: '#/components/schemas/ExecutionError' }]
+        duration_ms: { type: integer }
+
+    ExecutionError:
+      type: object
+      description: A user-code failure, returned with HTTP 200.
+      required: [kind, name, message]
+      properties:
+        kind:
+          type: string
+          enum: [runtime_error, compile_error, execution_timeout]
+        name: { type: string }
+        message: { type: string }
+
+    Error:
+      type: object
+      description: An API-level failure.
+      required: [code, error_code, message]
+      properties:
+        code: { type: integer }
+        error_code:
+          type: string
+          enum:
+            - invalid_request
+            - unauthorized
+            - sandbox_not_found
+            - sandbox_expired
+            - sandbox_terminated
+            - unsupported_template
+            - unsupported_language
+            - too_many_sandboxes
+            - too_many_requests
+            - internal_server_error
+        message: { type: string }

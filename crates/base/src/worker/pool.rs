@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::pending;
 use std::str::FromStr;
@@ -21,13 +22,16 @@ use ext_runtime::SharedMetricSource;
 use ext_runtime::SharedRateLimitTable;
 use ext_runtime::TraceRateLimiterConfig;
 use ext_workers::context::CreateUserWorkerResult;
+use ext_workers::context::RuntimeInitTimings;
 use ext_workers::context::SendRequestResult;
 use ext_workers::context::Timing;
 use ext_workers::context::TimingStatus;
 use ext_workers::context::UserWorkerMsgs;
 use ext_workers::context::UserWorkerProfile;
+use ext_workers::context::UserWorkerRuntimeProfile;
 use ext_workers::context::WorkerContextInitOpts;
 use ext_workers::context::WorkerRuntimeOpts;
+use ext_workers::context::WorkerShutdown;
 use ext_workers::errors::WorkerError;
 use futures_util::future::join_all;
 use http_v02::Request;
@@ -230,12 +234,16 @@ impl ActiveWorkerRegistry {
 // create_worker returns true if an active_worker is available for service_path (force create
 // retires current one adds new one)
 // send_request is called with UUID
+const COMPLETED_FINALIZATION_CACHE_CAPACITY: usize = 256;
+
 pub struct WorkerPool {
   pub flags: Arc<ServerFlags>,
   pub policy: WorkerPoolPolicy,
   pub metric_src: SharedMetricSource,
   pub shared_rate_limit_table: SharedRateLimitTable,
   pub user_workers: HashMap<Uuid, UserWorkerProfile>,
+  pending_finalizations: HashMap<Uuid, Vec<Sender<Option<WorkerShutdown>>>>,
+  completed_finalizations: VecDeque<(Uuid, WorkerShutdown)>,
   pub active_workers: HashMap<String, ActiveWorkerRegistry>,
   pub worker_pool_msgs_tx: mpsc::UnboundedSender<UserWorkerMsgs>,
   pub maybe_inspector: Option<Inspector>,
@@ -268,6 +276,8 @@ impl WorkerPool {
       shared_rate_limit_table,
       worker_event_sender,
       user_workers: HashMap::new(),
+      pending_finalizations: HashMap::new(),
+      completed_finalizations: VecDeque::new(),
       active_workers: HashMap::new(),
       maybe_inspector: inspector,
       worker_pool_msgs_tx,
@@ -293,13 +303,41 @@ impl WorkerPool {
       .as_user_worker()
       .is_some_and(|it| !is_oneshot_policy && it.force_create);
 
+    let runtime_profile = worker_options
+      .conf
+      .as_user_worker()
+      .map(|it| it.runtime_profile)
+      .unwrap_or_default();
+    let is_e2b_executor =
+      runtime_profile == UserWorkerRuntimeProfile::E2bExecutor;
+    let allow_node_vm = is_e2b_executor
+      || worker_options
+        .conf
+        .context()
+        .and_then(|it| it.get("allowNodeVm"))
+        .and_then(|it| it.as_bool())
+        .unwrap_or(false);
+    let allow_transpile = is_e2b_executor
+      || worker_options
+        .conf
+        .context()
+        .and_then(|it| it.get("allowTranspile"))
+        .and_then(|it| it.as_bool())
+        .unwrap_or(false);
+    let reuse_key = format!(
+      "{service_path}\0allowNodeVm={allow_node_vm}\0allowTranspile={allow_transpile}\0runtimeProfile={runtime_profile:?}"
+    );
+
     if let Some(ref active_worker_uuid) =
-      self.maybe_active_worker(&service_path, force_create)
+      self.maybe_active_worker(&reuse_key, force_create)
     {
       if tx
         .send(Ok(CreateUserWorkerResult {
           key: *active_worker_uuid,
           reused: true,
+          runtime_init_ms: 0,
+          module_init_ms: 0,
+          runtime_init: RuntimeInitTimings::default(),
         }))
         .is_err()
       {
@@ -320,7 +358,7 @@ impl WorkerPool {
     let wait_fence_fut = {
       let registry = self
         .active_workers
-        .entry(service_path.clone())
+        .entry(reuse_key.clone())
         .or_insert_with(|| {
           ActiveWorkerRegistry::new(self.policy.max_parallelism)
         });
@@ -452,6 +490,7 @@ impl WorkerPool {
 
       let uuid = uuid::Uuid::new_v4();
       let cancel = CancellationToken::new();
+      let supervise_cancel = CancellationToken::new();
       let (req_start_timing_tx, req_start_timing_rx) =
         mpsc::unbounded_channel::<Arc<Notify>>();
 
@@ -470,6 +509,7 @@ impl WorkerPool {
       user_worker_rt_opts.pool_msg_tx = Some(worker_pool_msgs_tx.clone());
       user_worker_rt_opts.events_msg_tx = events_msg_tx;
       user_worker_rt_opts.cancel = Some(cancel.clone());
+      user_worker_rt_opts.supervise_cancel = Some(supervise_cancel.clone());
 
       if let ext_runtime::RateLimiterOpts::Rules { rules, global_key } =
         std::mem::take(&mut user_worker_rt_opts.rate_limiter)
@@ -506,12 +546,13 @@ impl WorkerPool {
             worker_request_msg_tx: surface.msg_tx,
             early_drop_tx,
             timing_tx_pair: (req_start_timing_tx, req_end_timing_tx),
-            service_path,
+            service_path: reuse_key,
             permit: permit.map(Arc::new),
             status: status.clone(),
             exit: surface.exit,
             mem_check: surface.mem_check.clone(),
             cancel,
+            supervise_cancel,
           };
 
           if worker_pool_msgs_tx
@@ -524,6 +565,9 @@ impl WorkerPool {
             .send(Ok(CreateUserWorkerResult {
               key: uuid,
               reused: false,
+              runtime_init_ms: surface.boot_timings.runtime_init_ms,
+              module_init_ms: surface.boot_timings.module_init_ms,
+              runtime_init: surface.boot_timings.runtime_init,
             }))
             .is_err()
           {
@@ -541,6 +585,13 @@ impl WorkerPool {
   }
 
   pub fn add_user_worker(&mut self, key: Uuid, profile: UserWorkerProfile) {
+    // A worker can finish while booting, before this asynchronous Created
+    // message. The completed cache keeps its result available to late waiters
+    // while preventing the stale profile from being registered.
+    if self.completed_shutdown(&key).is_some() {
+      return;
+    }
+
     let registry = self
       .active_workers
       .entry(profile.service_path.clone())
@@ -679,21 +730,88 @@ impl WorkerPool {
     }
   }
 
-  pub fn shutdown(&mut self, key: &Uuid) {
+  fn deregister(&mut self, key: &Uuid) -> Option<UserWorkerProfile> {
     self.retire(key);
 
-    let Some((notify_tx, _)) = self
-      .user_workers
-      .remove(key)
-      .and_then(|it| self.active_workers.get(&it.service_path))
-      .map(|it| it.notify_pair.clone())
-    else {
-      return;
-    };
-
-    let _ = notify_tx.send(None);
+    let profile = self.user_workers.remove(key)?;
+    if let Some(registry) = self.active_workers.get(&profile.service_path) {
+      let (notify_tx, _) = registry.notify_pair.clone();
+      let _ = notify_tx.send(None);
+    }
 
     self.metric_src.decl_active_user_workers();
+    Some(profile)
+  }
+
+  pub fn shutdown(&mut self, key: &Uuid, shutdown: WorkerShutdown) {
+    self.deregister(key);
+
+    if let Some(waiters) = self.pending_finalizations.remove(key) {
+      for waiter in waiters {
+        let _ = waiter.send(Some(shutdown.clone()));
+      }
+    }
+
+    self.cache_completed_shutdown(*key, shutdown);
+  }
+
+  pub fn wait_for_shutdown(
+    &mut self,
+    key: &Uuid,
+    tx: Sender<Option<WorkerShutdown>>,
+  ) {
+    if let Some(shutdown) = self.completed_shutdown(key) {
+      let _ = tx.send(Some(shutdown.clone()));
+      return;
+    }
+
+    if self.pending_finalizations.contains_key(key)
+      || self.user_workers.contains_key(key)
+    {
+      self.pending_finalizations.entry(*key).or_default().push(tx);
+    } else {
+      let _ = tx.send(None);
+    }
+  }
+
+  /// Asks the worker's supervisor to terminate the isolate, then deregisters
+  /// it. Unlike `shutdown`, which waits for final worker telemetry, this
+  /// preserves the immediate terminate acknowledgement.
+  pub fn terminate(&mut self, key: &Uuid) -> bool {
+    let Some(profile) = self.deregister(key) else {
+      return false;
+    };
+
+    profile.supervise_cancel.cancel();
+    self.pending_finalizations.entry(*key).or_default();
+    true
+  }
+
+  fn completed_shutdown(&self, key: &Uuid) -> Option<&WorkerShutdown> {
+    self.completed_finalizations.iter().rev().find_map(
+      |(completed_key, shutdown)| (completed_key == key).then_some(shutdown),
+    )
+  }
+
+  fn cache_completed_shutdown(&mut self, key: Uuid, shutdown: WorkerShutdown) {
+    if let Some(position) = self
+      .completed_finalizations
+      .iter()
+      .position(|(completed_key, _)| *completed_key == key)
+    {
+      self.completed_finalizations.remove(position);
+    }
+
+    self.completed_finalizations.push_back((key, shutdown));
+    if self.completed_finalizations.len()
+      > COMPLETED_FINALIZATION_CACHE_CAPACITY
+    {
+      self.completed_finalizations.pop_front();
+    }
+  }
+
+  fn has_pending_finalizations(&self) -> bool {
+    !self.pending_finalizations.is_empty()
   }
 
   async fn try_cleanup_idle_workers(&mut self, timeout_ms: usize) -> usize {
@@ -836,7 +954,10 @@ pub async fn create_user_worker_pool(
           }, if !termination_requested => {
             termination_requested = true;
 
-            if worker_pool.user_workers.is_empty() {
+            if
+              worker_pool.user_workers.is_empty()
+                && !worker_pool.has_pending_finalizations()
+            {
                 if let Some(token) = token {
                     token.outbound.cancel();
                 }
@@ -867,12 +988,13 @@ pub async fn create_user_worker_pool(
                 worker_pool.idle(&key);
               }
 
-              Some(UserWorkerMsgs::Shutdown(key)) => {
-                worker_pool.shutdown(&key);
+              Some(UserWorkerMsgs::Shutdown(key, shutdown)) => {
+                worker_pool.shutdown(&key, shutdown);
 
                 if
                   termination_requested
                     && worker_pool.user_workers.is_empty()
+                    && !worker_pool.has_pending_finalizations()
                 {
                   if let Some(token) = token {
                     token.outbound.cancel();
@@ -880,6 +1002,17 @@ pub async fn create_user_worker_pool(
 
                   break;
                 }
+              }
+
+              Some(UserWorkerMsgs::Terminate(key, res_tx)) => {
+                // Deliberately do not wait for the worker's final shutdown
+                // report here. Existing terminate() callers need this immediate
+                // acknowledgement; waitForShutdown() receives the final data.
+                let _ = res_tx.send(worker_pool.terminate(&key));
+              }
+
+              Some(UserWorkerMsgs::WaitForShutdown(key, res_tx)) => {
+                worker_pool.wait_for_shutdown(&key, res_tx);
               }
 
               Some(UserWorkerMsgs::TryCleanupIdleWorkers(timeout_ms, res_tx)) => {
@@ -901,4 +1034,163 @@ pub async fn create_user_worker_pool(
   });
 
   Ok((metric_src, user_worker_msgs_tx))
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::RwLock;
+
+  use base_mem_check::MemCheckState;
+  use ext_workers::context::WorkerExit;
+
+  use super::*;
+
+  fn test_pool() -> (WorkerPool, CancellationToken) {
+    let cancel = CancellationToken::new();
+    let (pool_tx, _) = mpsc::unbounded_channel();
+    let flags = Arc::new(ServerFlags {
+      rate_limit_cleanup_interval_sec: 60,
+      ..Default::default()
+    });
+    let pool = WorkerPool::new(
+      flags,
+      WorkerPoolPolicy::default(),
+      SharedMetricSource::default(),
+      None,
+      pool_tx,
+      None,
+      cancel.clone(),
+    );
+
+    (pool, cancel)
+  }
+
+  fn test_profile() -> UserWorkerProfile {
+    let (worker_request_msg_tx, _) = mpsc::unbounded_channel();
+    let (early_drop_tx, _) = mpsc::unbounded_channel();
+    let (req_start_tx, _) = mpsc::unbounded_channel();
+    let (req_end_tx, _) = mpsc::unbounded_channel();
+
+    UserWorkerProfile {
+      worker_request_msg_tx,
+      early_drop_tx,
+      timing_tx_pair: (req_start_tx, req_end_tx),
+      service_path: "test".to_string(),
+      permit: None,
+      status: TimingStatus::default(),
+      exit: WorkerExit::default(),
+      mem_check: Arc::new(RwLock::new(MemCheckState::default())),
+      cancel: CancellationToken::new(),
+      supervise_cancel: CancellationToken::new(),
+    }
+  }
+
+  fn test_shutdown() -> WorkerShutdown {
+    WorkerShutdown {
+      reason: "TerminationRequested".to_string(),
+      cpu_time_used: 1,
+      memory_used: None,
+    }
+  }
+
+  #[tokio::test]
+  async fn wait_for_shutdown_after_finalization_gets_cached_data() {
+    let (mut pool, cancel) = test_pool();
+    let key = Uuid::new_v4();
+    let shutdown = test_shutdown();
+    pool.add_user_worker(key, test_profile());
+
+    assert!(pool.terminate(&key));
+    pool.shutdown(&key, shutdown.clone());
+
+    let (tx, rx) = oneshot::channel();
+    pool.wait_for_shutdown(&key, tx);
+
+    let received = rx
+      .await
+      .expect("final shutdown waiter dropped")
+      .expect("final shutdown result missing");
+    assert_eq!(received.reason, shutdown.reason);
+    assert_eq!(received.cpu_time_used, shutdown.cpu_time_used);
+    cancel.cancel();
+  }
+
+  #[tokio::test]
+  async fn wait_for_shutdown_after_terminate_waits_for_finalization() {
+    let (mut pool, cancel) = test_pool();
+    let key = Uuid::new_v4();
+    let shutdown = test_shutdown();
+    pool.add_user_worker(key, test_profile());
+
+    assert!(pool.terminate(&key));
+
+    let (tx, mut rx) = oneshot::channel();
+    pool.wait_for_shutdown(&key, tx);
+    assert!(
+      matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+      "waiter must await final shutdown"
+    );
+
+    pool.shutdown(&key, shutdown.clone());
+
+    let received = rx
+      .await
+      .expect("final shutdown waiter dropped")
+      .expect("final shutdown result missing");
+    assert_eq!(received.reason, shutdown.reason);
+    assert_eq!(received.cpu_time_used, shutdown.cpu_time_used);
+    cancel.cancel();
+  }
+
+  #[tokio::test]
+  async fn shutdown_before_created_uses_a_bounded_completed_cache() {
+    let (mut pool, cancel) = test_pool();
+    let first_key = Uuid::new_v4();
+    let mut last_key = None;
+
+    for index in 0..=COMPLETED_FINALIZATION_CACHE_CAPACITY {
+      let key = if index == 0 {
+        first_key
+      } else {
+        Uuid::new_v4()
+      };
+      let shutdown = WorkerShutdown {
+        cpu_time_used: index,
+        ..test_shutdown()
+      };
+      pool.shutdown(&key, shutdown);
+      pool.add_user_worker(key, test_profile());
+      assert!(
+        !pool.user_workers.contains_key(&key),
+        "a shutdown received before Created must not add a dead profile"
+      );
+      last_key = Some(key);
+    }
+    let last_key = last_key.expect("bounded cache loop must run");
+
+    assert_eq!(
+      pool.completed_finalizations.len(),
+      COMPLETED_FINALIZATION_CACHE_CAPACITY
+    );
+    assert!(pool.pending_finalizations.is_empty());
+
+    let (first_tx, first_rx) = oneshot::channel();
+    pool.wait_for_shutdown(&first_key, first_tx);
+    assert!(
+      first_rx
+        .await
+        .expect("evicted shutdown waiter dropped")
+        .is_none(),
+      "the oldest completed result must be evicted"
+    );
+
+    let (last_tx, last_rx) = oneshot::channel();
+    pool.wait_for_shutdown(&last_key, last_tx);
+    let last = last_rx
+      .await
+      .expect("cached shutdown waiter dropped")
+      .expect("newest completed result missing");
+    assert_eq!(last.cpu_time_used, COMPLETED_FINALIZATION_CACHE_CAPACITY);
+    cancel.cancel();
+  }
 }
