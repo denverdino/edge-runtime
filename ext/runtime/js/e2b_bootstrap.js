@@ -18,6 +18,11 @@ import * as url from "ext:deno_url/00_url.js";
 import "ext:deno_websocket/02_websocketstream.js";
 
 import { SUPABASE_ENV } from "ext:env/env.js";
+import {
+  getterOnly,
+  nonEnumerable,
+  readOnly,
+} from "ext:runtime_node_compat/fieldUtils.js";
 import { installPromiseHook, waitUntil } from "./async_hook.js";
 import { denoOverrides, fsVars } from "./denoOverrides.js";
 import { registerErrors } from "./errors.js";
@@ -33,25 +38,6 @@ const {
   ObjectKeys,
   ObjectSetPrototypeOf,
 } = primordials;
-
-const nonEnumerable = (value) => ({
-  value,
-  writable: true,
-  enumerable: false,
-  configurable: true,
-});
-const readOnly = (value) => ({
-  value,
-  enumerable: true,
-  writable: false,
-  configurable: true,
-});
-const getterOnly = (getter) => ({
-  get: getter,
-  set() {},
-  enumerable: true,
-  configurable: true,
-});
 
 let globalThis_;
 
